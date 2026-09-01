@@ -6,7 +6,8 @@ from copy import deepcopy
 from pathlib import Path
 
 from xenon.exclusions import DEFAULT_OPTIONAL_ENABLED, OPTIONAL_DIR_CATALOG, ExclusionPolicy
-from xenon.vault import CIPHER_CHACHA
+from xenon.vault import CIPHER_CHACHA, check_password_verifier, make_password_verifier
+from xenon.aggressiveness import DEFAULT_AGGRESSIVENESS, normalize_aggressiveness
 
 DEFAULT_CONFIG_DIR = Path.home() / ".config" / "xenon"
 DEFAULT_CONFIG_PATH = DEFAULT_CONFIG_DIR / "config.json"
@@ -17,6 +18,7 @@ DEFAULT_CONFIG = {
     "encryption": {
         "cipher": CIPHER_CHACHA,
         "key_file": None,
+        "aggressiveness": DEFAULT_AGGRESSIVENESS,
     },
     "exclusions": {
         "protect_system": True,
@@ -162,6 +164,35 @@ def write_default_config(path: Path | None = None, *, force: bool = False) -> Pa
     if target.exists() and not force:
         raise FileExistsError(f"Config already exists: {target}")
     return save_config(deepcopy(DEFAULT_CONFIG), target)
+
+
+def password_configured(config: dict | None) -> bool:
+    if not config:
+        return False
+    blob = (config.get("encryption") or {}).get("password")
+    return isinstance(blob, dict) and bool(blob.get("hash")) and bool(blob.get("salt"))
+
+
+def set_config_password(config: dict, password: str) -> None:
+    config.setdefault("encryption", {})["password"] = make_password_verifier(password)
+
+
+def config_password_matches(config: dict | None, password: str) -> bool:
+    if not config or not password:
+        return False
+    blob = (config.get("encryption") or {}).get("password")
+    return check_password_verifier(password, blob)
+
+
+def aggressiveness_from_config(config: dict | None) -> int:
+    if not config:
+        return DEFAULT_AGGRESSIVENESS
+    try:
+        return normalize_aggressiveness(
+            (config.get("encryption") or {}).get("aggressiveness")
+        )
+    except ValueError:
+        return DEFAULT_AGGRESSIVENESS
 
 
 def exclusion_policy_from_config(config: dict | None = None) -> ExclusionPolicy:

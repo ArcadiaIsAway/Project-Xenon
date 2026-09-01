@@ -7,11 +7,16 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+from xenon.aggressiveness import LEVELS, describe_level, get_level
 from xenon.config import (
+    aggressiveness_from_config,
+    config_password_matches,
     config_path,
     ensure_config,
     exclusion_policy_from_config,
+    password_configured,
     save_config,
+    set_config_password,
     targets_from_config,
 )
 from xenon.exclusions import OPTIONAL_DIR_CATALOG, PROTECTED_CATEGORIES
@@ -22,11 +27,15 @@ from xenon.vault import (
     CIPHER_SPECS,
     SUPPORTED_CIPHERS,
     generate_key_file,
+    is_destroyed_vault,
     is_locked,
+    is_passwordless_vault,
+    is_read_protect_vault,
     load_optional_key_file,
     lock_directory,
     normalize_cipher,
     password_opens,
+    rekey_directory,
     safe_file_size,
     unlock_directory,
     verify_directory,
@@ -158,10 +167,8 @@ def _status_block(session: SetupSession) -> None:
 
     cipher = session.config.get("encryption", {}).get("cipher")
     key_file = session.config.get("encryption", {}).get("key_file") or STYLE.dim("(none)")
-    if session.password_verified:
-        password = STYLE.green("verified")
-    elif session.password:
-        password = STYLE.yellow("set for lock · not a vault login")
+    if _password_is_set(session):
+        password = STYLE.green("set")
     else:
         password = STYLE.yellow("not set")
 
@@ -184,6 +191,7 @@ def _status_block(session: SetupSession) -> None:
 
     print(_kv("Targets", str(target_text)))
     print(_kv("Cipher", str(cipher)))
+    print(_kv("Aggressiveness", describe_level(aggressiveness_from_config(session.config))))
     print(_kv("Key file", str(key_file)))
     print(_kv("Password", password))
     print(_kv("Locked", locked))
@@ -208,16 +216,11 @@ def _render_menu(session: SetupSession) -> None:
         session.message_ok = None
 
     print()
-    pwd_item = (
-        "Enter master password"
-        if _locked_roots(session)
-        else "Set lock password"
-    )
     items = [
         ("1", "Manage targets and preview files"),
-        ("2", pwd_item),
+        ("2", "Set / change password"),
         ("3", "Verify encryption readiness"),
-        ("4", "Define encryption type"),
+        ("4", "Define encryption type and aggressiveness"),
         ("5", "Define encryption key (optional)"),
         ("6", "Manage exclusions"),
         ("7", "Exit"),
@@ -308,6 +311,10 @@ _INDEX_OPTIONAL = frozenset({
 def _target_status_mark(path: Path) -> str:
     if not path.exists() or not path.is_dir():
         return STYLE.red("missing")
+    if is_destroyed_vault(path):
+        return STYLE.red("wiped")
+    if is_read_protect_vault(path):
+        return STYLE.yellow("sealed")
     if is_locked(path):
         return STYLE.magenta("locked")
     return STYLE.green("dir")
@@ -361,21 +368,21 @@ def _password_opens_root(
     return password_opens(root, password, key_file=key_file)
 
 
-def _authorize_password(
-    session: SetupSession,
-    password: str,
-    roots: list[Path],
-) -> bool:
-    if not password:
-        return False
-    if not roots:
+def _passworded_locked_roots(session: SetupSession) -> list[Path]:
+    return [path for path in _locked_roots(session) if not is_passwordless_vault(path) and not is_destroyed_vault(path)]
+
+
+def _password_is_set(session: SetupSession) -> bool:
+    if password_configured(session.config):
         return True
-    return _password_opens_root(session, password, roots[0])
+    if session.password:
+        return True
+    return bool(_passworded_locked_roots(session))
 
 
 def _remember_verified(session: SetupSession, password: str) -> None:
     session.password = password
-    session.password_verified = True
+    session.password_verified = bool(password)
 
 
 def _clear_password(session: SetupSession) -> None:
@@ -383,45 +390,150 @@ def _clear_password(session: SetupSession) -> None:
     session.password_verified = False
 
 
-def _ensure_password(
+def _persist_password(session: SetupSession, password: str) -> None:
+    if not password:
+        return
+    if (
+        password_configured(session.config)
+        and config_password_matches(session.config, password)
+    ):
+        return
+    set_config_password(session.config, password)
+    save_config(session.config, session.config_file)
+
+
+def _read_new_password(*, session: SetupSession | None = None) -> str | None:
+    password = getpass.getpass("New password: ")
+    if not password:
+        message = "Password cannot be empty."
+        if session is not None:
+            session.message = message
+            session.message_ok = False
+        else:
+            print(STYLE.red(message))
+        return None
+    confirm_pw = getpass.getpass("Confirm password: ")
+    if password != confirm_pw:
+        message = "Passwords do not match."
+        if session is not None:
+            session.message = message
+            session.message_ok = False
+        else:
+            print(STYLE.red(message))
+        return None
+    return password
+
+
+def _rekey_locked_targets(
+    session: SetupSession,
+    old_password: str,
+    new_password: str,
+) -> None:
+    cipher, key_file, policy = _session_crypto(session)
+    for root in _locked_roots(session):
+        if is_destroyed_vault(root):
+            continue
+        current = "" if is_passwordless_vault(root) else old_password
+        rekey_directory(
+            root,
+            current,
+            new_password,
+            key_file=key_file,
+            cipher_name=cipher,
+            policy=policy,
+        )
+
+
+def _session_password_opens(
+    session: SetupSession,
+    password: str,
+    roots: list[Path] | None = None,
+) -> bool:
+    if password_configured(session.config):
+        if not config_password_matches(session.config, password):
+            return False
+    check = roots if roots is not None else _passworded_locked_roots(session)
+    for root in check:
+        if is_passwordless_vault(root):
+            continue
+        if not _password_opens_root(session, password, root):
+            return False
+    return True
+
+
+def _require_existing_password(
     session: SetupSession,
     *,
-    confirm: bool = False,
-    verify_roots: list[Path] | None = None,
+    roots: list[Path] | None = None,
 ) -> str | None:
-    """Return a password for crypto ops. Unlock paths must open an existing vault."""
-    roots = [path for path in (verify_roots or []) if is_locked(path)]
-
-    if roots:
-        if (
-            session.password
-            and session.password_verified
-            and _authorize_password(session, session.password, roots)
-        ):
-            return session.password
-
-        password = getpass.getpass("Master password: ")
-        if not _authorize_password(session, password, roots):
-            _clear_password(session)
-            print(STYLE.red("Wrong password."))
-            return None
-        _remember_verified(session, password)
-        return password
-
-    if session.password:
-        return session.password
-
-    password = getpass.getpass("Master password: ")
-    if not password:
-        print(STYLE.red("Password cannot be empty."))
+    passworded = [
+        path
+        for path in (roots if roots is not None else _locked_roots(session))
+        if is_locked(path) and not is_passwordless_vault(path)
+    ]
+    password = getpass.getpass("Password: ")
+    if not password or not _session_password_opens(session, password, passworded):
+        _clear_password(session)
+        print(STYLE.red("Wrong password."))
         return None
-    if confirm:
-        again = getpass.getpass("Confirm password: ")
-        if password != again:
-            print(STYLE.red("Passwords do not match."))
-            return None
-    session.password = password
-    session.password_verified = False
+    _persist_password(session, password)
+    _remember_verified(session, password)
+    return password
+
+
+def _ensure_lock_password(session: SetupSession) -> str | None:
+    spec = get_level(aggressiveness_from_config(session.config))
+    if spec.passwordless or (spec.destructive and not spec.needs_password):
+        return ""
+    if _password_is_set(session):
+        return _require_existing_password(session)
+
+    print()
+    print(STYLE.yellow("This aggressiveness level requires a password."))
+    password = _read_new_password()
+    if password is None:
+        return None
+    try:
+        _rekey_locked_targets(session, "", password)
+    except Exception as exc:
+        print(STYLE.red(f"Could not update locked targets: {exc}"))
+        return None
+    _persist_password(session, password)
+    _remember_verified(session, password)
+    return password
+
+
+def _ensure_unlock_password(
+    session: SetupSession,
+    roots: list[Path],
+) -> str | None:
+    passworded = [
+        path
+        for path in roots
+        if is_locked(path)
+        and not is_passwordless_vault(path)
+        and not is_destroyed_vault(path)
+    ]
+    if not passworded:
+        return ""
+    return _require_existing_password(session, roots=passworded)
+
+
+def _ensure_panic_password(session: SetupSession) -> str | None:
+    if not password_configured(session.config):
+        print(
+            STYLE.red(
+                "Panic requires a password. Set one from menu option 2 first."
+            )
+        )
+        print(STYLE.dim("Panic will not run without a password."))
+        return None
+    password = getpass.getpass("Password: ")
+    if not password or not config_password_matches(session.config, password):
+        print(STYLE.red("Wrong password."))
+        print(STYLE.red("Panic cannot run without a password."))
+        return None
+    _remember_verified(session, password)
     return password
 
 
@@ -449,13 +561,31 @@ def _print_probe_summary(report) -> None:
     )
 
 
+def _confirm_destructive_lock(level: int) -> bool:
+    spec = get_level(level)
+    if not spec.destructive:
+        return True
+    print()
+    if spec.level == 4:
+        print(STYLE.yellow(STYLE.bold("This will delete files without overwriting.")))
+        print(STYLE.dim("Data may still be recoverable from disk."))
+        answer = input(STYLE.cyan("Type YES to delete files › ")).strip()
+        return answer == "YES"
+    print(STYLE.red(STYLE.bold("This will overwrite and permanently destroy files.")))
+    print(STYLE.dim("This cannot be undone."))
+    answer = input(STYLE.cyan("Type DESTROY to continue › ")).strip()
+    return answer == "DESTROY"
+
+
 def _run_lock_targets(session: SetupSession, selected: list[str]) -> None:
-    existing = _locked_roots(session)
-    password = _ensure_password(
-        session,
-        confirm=True,
-        verify_roots=existing,
-    )
+    level = aggressiveness_from_config(session.config)
+    spec = get_level(level)
+    if spec.destructive and not _confirm_destructive_lock(level):
+        print(STYLE.yellow("Lock cancelled."))
+        _pause()
+        return
+
+    password = _ensure_lock_password(session)
     if password is None:
         _pause()
         return
@@ -467,7 +597,7 @@ def _run_lock_targets(session: SetupSession, selected: list[str]) -> None:
     for raw in selected:
         root = Path(raw).expanduser()
         print()
-        print(STYLE.bold(f"Lock  {root}"))
+        print(STYLE.bold(f"{spec.title}  {root}"))
         if not root.is_dir():
             print(STYLE.red("Not a directory."))
             failed += 1
@@ -483,18 +613,20 @@ def _run_lock_targets(session: SetupSession, selected: list[str]) -> None:
                 cipher_name=cipher,
                 key_file=key_file,
                 policy=policy,
+                aggressiveness=level,
             )
             locked += 1
         except Exception as exc:
             print(STYLE.red(f"Lock failed: {exc}"))
             failed += 1
 
-    if locked:
+    if locked and password:
+        _persist_password(session, password)
         _remember_verified(session, password)
 
     print()
     print(
-        f"{STYLE.green(f'{locked} locked')}  ·  "
+        f"{STYLE.green(f'{locked} applied')}  ·  "
         f"{STYLE.yellow(f'{skipped} skipped')}  ·  "
         f"{STYLE.red(f'{failed} failed')}"
     )
@@ -507,7 +639,7 @@ def _run_unlock_targets(session: SetupSession, selected: list[str]) -> None:
         for raw in selected
         if is_locked(Path(raw).expanduser())
     ]
-    password = _ensure_password(session, verify_roots=locked_selected)
+    password = _ensure_unlock_password(session, locked_selected)
     if password is None:
         _pause()
         return
@@ -556,7 +688,7 @@ def _run_check_targets(session: SetupSession, selected: list[str]) -> None:
             for raw in selected
             if is_locked(Path(raw).expanduser())
         ]
-        password = _ensure_password(session, verify_roots=locked_selected)
+        password = _ensure_unlock_password(session, locked_selected)
         if password is None:
             _pause()
             return
@@ -569,7 +701,13 @@ def _run_check_targets(session: SetupSession, selected: list[str]) -> None:
             print(STYLE.red(f"Not a usable directory: {root}"))
             continue
         if is_locked(root):
-            print(STYLE.dim("Already locked — verifying ciphertext integrity."))
+            if is_destroyed_vault(root):
+                print(STYLE.red("Destroyed — files cannot be restored."))
+                continue
+            if is_read_protect_vault(root):
+                print(STYLE.dim("Read-protected — verifying sealed permissions."))
+            else:
+                print(STYLE.dim("Already locked — verifying ciphertext integrity."))
             try:
                 verify_directory(root, password or "", key_file=key_file)
             except Exception as exc:
@@ -595,7 +733,9 @@ def _run_panic_targets(session: SetupSession, selected: list[str]) -> None:
 
     print()
     print(STYLE.red(STYLE.bold("Panic")))
-    print(f"  Encrypt: {', '.join(selected)}")
+    spec = get_level(aggressiveness_from_config(session.config))
+    print(f"  Action: {spec.title} — {spec.summary}")
+    print(f"  Targets: {', '.join(selected)}")
     print(f"  Screen lock: {'yes' if lock_screen else 'no'}")
     print(f"  Kill session: {'yes' if kill_session else 'no'}")
     print()
@@ -605,12 +745,7 @@ def _run_panic_targets(session: SetupSession, selected: list[str]) -> None:
         _pause()
         return
 
-    existing = _locked_roots(session)
-    password = _ensure_password(
-        session,
-        confirm=True,
-        verify_roots=existing,
-    )
+    password = _ensure_panic_password(session)
     if password is None:
         _pause()
         return
@@ -648,6 +783,7 @@ def _run_panic_targets(session: SetupSession, selected: list[str]) -> None:
                 cipher_name=cipher,
                 key_file=key_file,
                 policy=policy,
+                aggressiveness=aggressiveness_from_config(session.config),
             )
     except Exception as exc:
         print(STYLE.red(f"Lock failed: {exc}"))
@@ -826,53 +962,70 @@ def action_manage_targets(session: SetupSession) -> None:
 
 def action_set_password(session: SetupSession) -> None:
     _clear()
-    locked = _locked_roots(session)
-
-    if locked:
-        _box_title("Enter master password")
-        print(
-            STYLE.dim(
-                "Locked targets already have a vault password. "
-                "Setup cannot change it. Enter the current password to authorize "
-                "this session. To choose a new password, unlock first, then lock again."
-            )
-        )
-        print()
-        print(STYLE.dim(f"Locked: {locked[0]}"))
-        print()
-        password = getpass.getpass("Master password: ")
-        if not _authorize_password(session, password, locked):
-            _clear_password(session)
-            session.message = "Wrong password. Vault password was not changed."
-            session.message_ok = False
-            return
-        _remember_verified(session, password)
-        session.message = "Password verified for this session."
-        session.message_ok = True
-        return
-
-    _box_title("Set lock password")
+    _box_title("Set / change password")
     print(
         STYLE.dim(
-            "Used only to lock unlocked targets in this session. "
-            "Never written to disk. This does not change any existing vault."
+            "This password locks, unlocks, and is required for panic. "
+            "It is stored as a verifier in config, never as plaintext."
         )
     )
     print()
-    password = getpass.getpass("Master password: ")
-    confirm_pw = getpass.getpass("Confirm password: ")
-    if not password:
-        session.message = "Password cannot be empty."
-        session.message_ok = False
-        return
-    if password != confirm_pw:
-        session.message = "Passwords do not match."
-        session.message_ok = False
+
+    configured = password_configured(session.config)
+    passworded = _passworded_locked_roots(session)
+    has_existing = configured or bool(passworded)
+
+    if has_existing:
+        print(STYLE.dim("Enter the current password to change it."))
+        print()
+        old = getpass.getpass("Current password: ")
+        if configured and not config_password_matches(session.config, old):
+            _clear_password(session)
+            session.message = "Wrong password. Password was not changed."
+            session.message_ok = False
+            return
+        if passworded and not _session_password_opens(session, old, passworded):
+            _clear_password(session)
+            session.message = "Wrong password. Password was not changed."
+            session.message_ok = False
+            return
+        if not old:
+            _clear_password(session)
+            session.message = "Wrong password. Password was not changed."
+            session.message_ok = False
+            return
+
+        new = _read_new_password(session=session)
+        if new is None:
+            return
+        try:
+            _rekey_locked_targets(session, old, new)
+        except Exception as exc:
+            session.message = f"Could not update locked targets: {exc}"
+            session.message_ok = False
+            return
+        set_config_password(session.config, new)
+        save_config(session.config, session.config_file)
+        _remember_verified(session, new)
+        session.message = "Password updated."
+        session.message_ok = True
         return
 
-    session.password = password
-    session.password_verified = False
-    session.message = "Lock password set for this session."
+    print(STYLE.dim("No password is set yet. Choose one now."))
+    print()
+    new = _read_new_password(session=session)
+    if new is None:
+        return
+    try:
+        _rekey_locked_targets(session, "", new)
+    except Exception as exc:
+        session.message = f"Could not update locked targets: {exc}"
+        session.message_ok = False
+        return
+    set_config_password(session.config, new)
+    save_config(session.config, session.config_file)
+    _remember_verified(session, new)
+    session.message = "Password set."
     session.message_ok = True
 
 
@@ -1225,15 +1378,33 @@ def _remediate_probe_issues(session: SetupSession, reports: list) -> bool:
 
 def action_encryption_type(session: SetupSession) -> None:
     _clear()
-    _box_title("Define encryption type")
-    current = session.config.get("encryption", {}).get("cipher")
+    _box_title("Encryption type and aggressiveness")
+    encryption = session.config.setdefault("encryption", {})
+    current_level = aggressiveness_from_config(session.config)
+    current_cipher = encryption.get("cipher")
     try:
-        current_name = normalize_cipher(current)
+        current_name = normalize_cipher(current_cipher)
     except ValueError:
-        current_name = current
-    print(_kv("Current", str(current)))
+        current_name = current_cipher
+
+    print(_kv("Aggressiveness", describe_level(current_level)))
+    print(_kv("Cipher", str(current_cipher)))
     print()
-    width = max(len(spec.name) for spec in CIPHER_SPECS)
+    print(STYLE.bold("Aggressiveness"))
+    print(STYLE.dim("Controls what lock / panic do to target files."))
+    print()
+    for spec in LEVELS:
+        marker = STYLE.green("  ← current") if spec.level == current_level else ""
+        risk = STYLE.red(" irreversible") if spec.destructive else ""
+        print(
+            f"  {STYLE.cyan(str(spec.level))}) {spec.title}{risk}{marker}"
+        )
+        print(f"      {STYLE.dim(spec.summary)}")
+    print()
+    print(STYLE.bold("Cipher"))
+    print(STYLE.dim("Used when encrypting (levels 2 and 3)."))
+    print()
+    width = max(len(item.name) for item in CIPHER_SPECS)
     for index, spec in enumerate(CIPHER_SPECS, 1):
         marker = STYLE.green("  ← current") if spec.name == current_name else ""
         print(
@@ -1241,32 +1412,66 @@ def action_encryption_type(session: SetupSession) -> None:
             f"{STYLE.dim(spec.summary)}{marker}"
         )
     print()
-    print(STYLE.dim("Enter a number, or type a cipher name."))
-    choice = input(STYLE.cyan("Select cipher › ")).strip()
-    if not choice:
-        session.message = "Cipher unchanged."
-        return
+    print(STYLE.dim("Enter to keep a value unchanged."))
 
-    selected: str | None = None
-    try:
-        index = int(choice)
-        if 1 <= index <= len(SUPPORTED_CIPHERS):
-            selected = SUPPORTED_CIPHERS[index - 1]
-    except ValueError:
-        pass
-
-    if selected is None:
+    raw_level = input(STYLE.cyan("Aggressiveness [1-5] › ")).strip()
+    if raw_level:
         try:
-            selected = normalize_cipher(choice)
-        except ValueError:
-            session.message = "Invalid selection."
+            new_level = int(raw_level)
+            spec = get_level(new_level)
+        except (TypeError, ValueError):
+            session.message = "Invalid aggressiveness. Choose 1-5."
             session.message_ok = False
             return
+        if spec.level == 5 and spec.level != current_level:
+            if not password_configured(session.config):
+                session.message = (
+                    "Level 5 requires a password. Set one from menu option 2 first."
+                )
+                session.message_ok = False
+                return
+            print()
+            print(STYLE.red(STYLE.bold("Highest-risk option")))
+            print(
+                STYLE.dim(
+                    "Lock and panic will overwrite files multiple times, then delete them."
+                )
+            )
+            password = getpass.getpass("Password: ")
+            if not config_password_matches(session.config, password):
+                session.message = "Wrong password. Aggressiveness was not changed."
+                session.message_ok = False
+                return
+            confirm_text = input(STYLE.cyan("Type DESTROY to confirm › ")).strip()
+            if confirm_text != "DESTROY":
+                session.message = "Level 5 cancelled."
+                return
+        encryption["aggressiveness"] = spec.level
+        current_level = spec.level
 
-    selected = normalize_cipher(selected)
-    session.config.setdefault("encryption", {})["cipher"] = selected
+    raw_cipher = input(STYLE.cyan("Cipher [number or name] › ")).strip()
+    if raw_cipher:
+        selected: str | None = None
+        try:
+            index = int(raw_cipher)
+            if 1 <= index <= len(SUPPORTED_CIPHERS):
+                selected = SUPPORTED_CIPHERS[index - 1]
+        except ValueError:
+            pass
+        if selected is None:
+            try:
+                selected = normalize_cipher(raw_cipher)
+            except ValueError:
+                session.message = "Invalid cipher selection."
+                session.message_ok = False
+                return
+        encryption["cipher"] = normalize_cipher(selected)
+
     save_config(session.config, session.config_file)
-    session.message = f"Cipher set to {selected}."
+    session.message = (
+        f"Aggressiveness {describe_level(current_level)}; "
+        f"cipher {encryption.get('cipher')}."
+    )
     session.message_ok = True
 
 
@@ -1460,30 +1665,6 @@ def run_setup(*, config_file: Path | None = None) -> int:
     target = config_file or config_path()
     config = ensure_config(target)
     session = SetupSession(config=config, config_file=target)
-
-    locked = _locked_roots(session)
-    if locked:
-        _clear()
-        _box_title("Master password required")
-        print(
-            STYLE.dim(
-                "One or more targets are locked. Enter the existing vault password "
-                "to continue. Setup cannot replace that password."
-            )
-        )
-        print()
-        print(STYLE.dim(f"Locked: {locked[0]}"))
-        print()
-        try:
-            password = getpass.getpass("Master password: ")
-        except (EOFError, KeyboardInterrupt):
-            print()
-            print(STYLE.yellow("Cancelled."))
-            return 130
-        if not _authorize_password(session, password, locked):
-            print(STYLE.red("Wrong password."))
-            return 1
-        _remember_verified(session, password)
 
     actions = {
         "1": action_manage_targets,

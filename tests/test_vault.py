@@ -10,9 +10,14 @@ from xenon.vault import (
     SUPPORTED_CIPHERS,
     XChaCha20Poly1305,
     _hchacha20,
+    check_password_verifier,
     generate_key_file,
+    is_destroyed_vault,
     is_locked,
+    is_passwordless_vault,
+    is_read_protect_vault,
     lock_directory,
+    make_password_verifier,
     normalize_cipher,
     password_opens,
     unlock_directory,
@@ -275,6 +280,29 @@ def test_password_opens_rejects_wrong_secret(tmp_path: Path):
     assert not password_opens(sample, "correct-horse")
 
 
+def test_passwordless_lock_unlock(tmp_path: Path):
+    sample = tmp_path / "data"
+    sample.mkdir()
+    (sample / "a.txt").write_text("hello", encoding="utf-8")
+    lock_directory(sample, "", aggressiveness=2)
+    assert is_passwordless_vault(sample)
+    assert password_opens(sample, "")
+    verify_directory(sample, "")
+    unlock_directory(sample, "")
+    assert not is_locked(sample)
+    assert (sample / "a.txt").read_text(encoding="utf-8") == "hello"
+
+
+def test_password_verifier_roundtrip():
+    blob = make_password_verifier("correct-horse")
+    assert "correct-horse" not in str(blob)
+    assert check_password_verifier("correct-horse", blob)
+    assert not check_password_verifier("wrong-battery", blob)
+    assert not check_password_verifier("", blob)
+    with pytest.raises(ValueError, match="empty"):
+        make_password_verifier("")
+
+
 def test_project_protection(tmp_path: Path):
     policy = ExclusionPolicy()
     project_file = Path(__file__).resolve()
@@ -297,3 +325,57 @@ def test_targets_migrate_from_legacy_source():
         }
     )
     assert targets_from_config(multi) == ["~/a", "~/b"]
+
+
+def test_read_protect_roundtrip(tmp_path: Path):
+    sample = tmp_path / "data"
+    sample.mkdir()
+    target = sample / "secret.txt"
+    target.write_text("classified", encoding="utf-8")
+    original_mode = target.stat().st_mode & 0o777
+
+    lock_directory(sample, "correct-horse", aggressiveness=1)
+    assert is_read_protect_vault(sample)
+    assert target.is_file()
+    assert target.stat().st_mode & 0o777 == 0
+    with pytest.raises(PermissionError):
+        target.read_text(encoding="utf-8")
+
+    unlock_directory(sample, "correct-horse")
+    assert not is_locked(sample)
+    assert target.read_text(encoding="utf-8") == "classified"
+    assert target.stat().st_mode & 0o777 == original_mode
+
+
+def test_delete_without_overwrite(tmp_path: Path):
+    sample = tmp_path / "data"
+    sample.mkdir()
+    target = sample / "secret.txt"
+    target.write_text("classified", encoding="utf-8")
+
+    lock_directory(sample, "", aggressiveness=4)
+    assert is_destroyed_vault(sample)
+    assert not target.exists()
+    with pytest.raises(ValueError, match="destroyed"):
+        unlock_directory(sample, "anything")
+
+
+def test_secure_destruction(tmp_path: Path):
+    sample = tmp_path / "data"
+    sample.mkdir()
+    target = sample / "secret.txt"
+    target.write_text("classified", encoding="utf-8")
+
+    lock_directory(sample, "correct-horse", aggressiveness=5)
+    assert is_destroyed_vault(sample)
+    assert not target.exists()
+    with pytest.raises(ValueError, match="destroyed"):
+        unlock_directory(sample, "correct-horse")
+
+
+def test_standard_encryption_rejects_empty_password(tmp_path: Path):
+    sample = tmp_path / "data"
+    sample.mkdir()
+    (sample / "a.txt").write_text("hello", encoding="utf-8")
+    with pytest.raises(ValueError, match="requires a password"):
+        lock_directory(sample, "", aggressiveness=3)

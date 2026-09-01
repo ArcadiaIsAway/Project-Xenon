@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import errno
+import hmac
 import json
 import os
 import struct
@@ -21,9 +22,19 @@ from cryptography.hazmat.primitives.ciphers.aead import (
 from cryptography.hazmat.primitives.kdf.argon2 import Argon2id
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
+from xenon.aggressiveness import (
+    DEFAULT_AGGRESSIVENESS,
+    normalize_aggressiveness,
+)
+
 
 VERSION = 4
 SUPPORTED_VERSIONS = {2, 3, 4}
+MODE_IN_PLACE = "in-place"
+MODE_READ_PROTECT = "read-protect"
+MODE_DESTROYED = "destroyed"
+DESTROY_OVERWRITE_PASSES = 3
+WIPE_CHUNK = 1024 * 1024
 SALT_SIZE = 16
 NONCE_SIZE = 12
 KEY_SIZE = 32
@@ -32,6 +43,8 @@ NAME_PREFIX = "xenon-"
 XENON_DIRNAME = ".xenon"
 MAGIC = b"XENON\x02"
 MANIFEST_AAD = b"xenon-manifest"
+PASSWORDLESS_MATERIAL = b"xenon-passwordless-v1"
+VERIFIER_LENGTH = 32
 
 CIPHER_CHACHA = "ChaCha20-Poly1305"
 CIPHER_XCHACHA = "XChaCha20-Poly1305"
@@ -269,9 +282,7 @@ def derive_key(
     key_size: int = KEY_SIZE,
     cipher_name: str = CIPHER_CHACHA,
 ) -> bytes:
-    if not password:
-        raise ValueError("Password cannot be empty.")
-
+    material = password.encode("utf-8") if password else PASSWORDLESS_MATERIAL
     kdf = Argon2id(
         salt=salt,
         length=KEY_SIZE,
@@ -279,7 +290,7 @@ def derive_key(
         lanes=4,
         memory_cost=64 * 1024,
     )
-    key = kdf.derive(password.encode("utf-8"))
+    key = kdf.derive(material)
 
     if key_file is not None:
         key_path = Path(key_file).expanduser()
@@ -322,6 +333,107 @@ def manifest_path(root: Path) -> Path:
 
 def is_locked(root: Path) -> bool:
     return manifest_path(root).is_file()
+
+
+def peek_manifest(root: Path) -> dict[str, Any] | None:
+    path = manifest_path(root)
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return payload
+
+
+def vault_mode(root: Path) -> str | None:
+    manifest = peek_manifest(root)
+    if manifest is None:
+        return None
+    return str(manifest.get("mode") or MODE_IN_PLACE)
+
+
+def is_passwordless_vault(root: Path) -> bool:
+    manifest = peek_manifest(root)
+    if manifest is None:
+        return False
+    if (manifest.get("mode") or MODE_IN_PLACE) != MODE_IN_PLACE:
+        return False
+    return bool((manifest.get("kdf") or {}).get("passwordless"))
+
+
+def is_read_protect_vault(root: Path) -> bool:
+    return vault_mode(root) == MODE_READ_PROTECT
+
+
+def is_destroyed_vault(root: Path) -> bool:
+    return vault_mode(root) == MODE_DESTROYED
+
+
+def vault_aggressiveness(root: Path) -> int:
+    manifest = peek_manifest(root)
+    if manifest is None:
+        return DEFAULT_AGGRESSIVENESS
+    stored = manifest.get("aggressiveness")
+    if stored is not None:
+        try:
+            return normalize_aggressiveness(stored)
+        except ValueError:
+            pass
+    if is_read_protect_vault(root):
+        return 1
+    if is_destroyed_vault(root):
+        method = str(manifest.get("method") or "")
+        return 5 if method == "overwrite" else 4
+    if is_passwordless_vault(root):
+        return 2
+    return 3
+
+
+def make_password_verifier(password: str) -> dict[str, Any]:
+    if not password:
+        raise ValueError("Password cannot be empty.")
+    salt = os.urandom(SALT_SIZE)
+    digest = Argon2id(
+        salt=salt,
+        length=VERIFIER_LENGTH,
+        iterations=3,
+        lanes=4,
+        memory_cost=64 * 1024,
+    ).derive(password.encode("utf-8"))
+    return {
+        "algorithm": "Argon2id",
+        "salt": salt.hex(),
+        "hash": digest.hex(),
+        "length": VERIFIER_LENGTH,
+        "iterations": 3,
+        "lanes": 4,
+        "memory_cost": 64 * 1024,
+    }
+
+
+def check_password_verifier(password: str, verifier: object) -> bool:
+    if not password or not isinstance(verifier, dict):
+        return False
+    try:
+        salt = bytes.fromhex(str(verifier["salt"]))
+        expected = bytes.fromhex(str(verifier["hash"]))
+        length = int(verifier.get("length") or VERIFIER_LENGTH)
+        iterations = int(verifier.get("iterations") or 3)
+        lanes = int(verifier.get("lanes") or 4)
+        memory_cost = int(verifier.get("memory_cost") or 64 * 1024)
+    except (KeyError, ValueError, TypeError):
+        return False
+    digest = Argon2id(
+        salt=salt,
+        length=length,
+        iterations=iterations,
+        lanes=lanes,
+        memory_cost=memory_cost,
+    ).derive(password.encode("utf-8"))
+    return hmac.compare_digest(digest, expected)
 
 
 def iter_target_files(
@@ -651,6 +763,226 @@ def decrypt_in_place(
     _atomic_write(path, plaintext)
 
 
+def _remove_manifest(root: Path) -> None:
+    path = manifest_path(root)
+    path.unlink(missing_ok=True)
+    meta = xenon_dir(root)
+    try:
+        next(meta.iterdir())
+    except StopIteration:
+        meta.rmdir()
+    except FileNotFoundError:
+        pass
+
+
+def _kdf_block(
+    salt: bytes,
+    *,
+    key_file: Path | None,
+    passwordless: bool,
+) -> dict[str, Any]:
+    return {
+        "algorithm": "Argon2id",
+        "salt": salt.hex(),
+        "length": KEY_SIZE,
+        "iterations": 3,
+        "lanes": 4,
+        "memory_cost": 64 * 1024,
+        "key_file": bool(key_file),
+        "passwordless": passwordless,
+    }
+
+
+def _overwrite_file(path: Path, *, passes: int = DESTROY_OVERWRITE_PASSES) -> None:
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return
+    if size <= 0:
+        return
+    patterns = (b"\x00", b"\xff", None)
+    with path.open("r+b", buffering=0) as handle:
+        for index in range(passes):
+            pattern = patterns[index] if index < len(patterns) else None
+            handle.seek(0)
+            remaining = size
+            while remaining:
+                chunk = min(remaining, WIPE_CHUNK)
+                data = os.urandom(chunk) if pattern is None else (pattern * chunk)
+                handle.write(data)
+                remaining -= chunk
+            handle.flush()
+            os.fsync(handle.fileno())
+
+
+def _lock_read_protect(
+    root: Path,
+    password: str,
+    *,
+    cipher_name: str,
+    key_file: Path | None,
+    policy: Any | None,
+) -> None:
+    if not password:
+        raise ValueError("Read protection requires a password.")
+
+    files = iter_target_files(
+        root,
+        policy=policy,
+        show_progress=True,
+        label="Scanning",
+    )
+    if not files:
+        raise ValueError("Directory contains no files to protect.")
+
+    spec = get_cipher_spec(cipher_name)
+    salt = os.urandom(SALT_SIZE)
+    key = derive_key(
+        password,
+        salt,
+        key_file=key_file,
+        key_size=spec.key_size,
+        cipher_name=cipher_name,
+    )
+    cipher = make_cipher(cipher_name, key)
+    xenon_dir(root).mkdir(parents=True, exist_ok=True)
+
+    entries: list[dict] = []
+    print(f"Sealing read access: {root}")
+    print()
+    from xenon.progress import Progress
+
+    progress = Progress("Sealing", total=len(files))
+    try:
+        for path in files:
+            relative = path.relative_to(root).as_posix()
+            progress.update(1, suffix=relative[:48])
+            mode = path.stat().st_mode
+            os.chmod(path, 0o000)
+            entries.append({"path": relative, "mode": mode & 0o777})
+        manifest = {
+            "version": VERSION,
+            "mode": MODE_READ_PROTECT,
+            "aggressiveness": 1,
+            "names": {"encrypted": False},
+            "kdf": _kdf_block(salt, key_file=key_file, passwordless=False),
+            "cipher": {
+                "algorithm": cipher_name,
+                "nonce_size": spec.nonce_size,
+                "key_size": spec.key_size,
+                "magic": MAGIC.hex(),
+            },
+            "inventory": encrypt_inventory(cipher, entries, []),
+        }
+        manifest_path(root).write_text(
+            json.dumps(manifest, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    except Exception:
+        print()
+        print(
+            "ERROR during read-protect. Some files may already be sealed. "
+            "Do not delete .xenon/; unlock with the same password once "
+            "a manifest exists, or restore from backup."
+        )
+        raise
+    finally:
+        progress.close()
+
+    print()
+    print("Directory sealed (read protection).")
+    print(f"Files: {len(entries)}")
+    print(f"Manifest: {manifest_path(root)}")
+
+
+def _unlock_read_protect(
+    root: Path,
+    password: str,
+    *,
+    key_file: Path | None,
+) -> None:
+    root, _manifest, _cipher, files, _dirs = load_locked(
+        root,
+        password,
+        key_file=key_file,
+    )
+    print(f"Restoring read access: {root}")
+    print()
+    from xenon.progress import Progress
+
+    progress = Progress("Unsealing", total=len(files))
+    try:
+        for entry in files:
+            relative = entry["path"]
+            progress.update(1, suffix=relative[:48])
+            path = root / relative
+            if not path.is_file():
+                continue
+            mode = int(entry.get("mode") or 0o600)
+            os.chmod(path, mode)
+    finally:
+        progress.close()
+    _remove_manifest(root)
+    print()
+    print("Directory unsealed.")
+
+
+def _destroy_directory(
+    root: Path,
+    *,
+    overwrite: bool,
+    policy: Any | None,
+) -> None:
+    files = iter_target_files(
+        root,
+        policy=policy,
+        show_progress=True,
+        label="Scanning",
+    )
+    if not files:
+        raise ValueError("Directory contains no files to delete.")
+
+    level = 5 if overwrite else 4
+    method = "overwrite" if overwrite else "unlink"
+    action = "Destroying" if overwrite else "Deleting"
+    print(f"{action} files in: {root}")
+    print()
+    from xenon.progress import Progress
+
+    progress = Progress(action, total=len(files))
+    removed = 0
+    try:
+        for path in files:
+            relative = path.relative_to(root).as_posix()
+            progress.update(1, suffix=relative[:48])
+            if overwrite:
+                _overwrite_file(path)
+            path.unlink()
+            removed += 1
+        xenon_dir(root).mkdir(parents=True, exist_ok=True)
+        tombstone = {
+            "version": VERSION,
+            "mode": MODE_DESTROYED,
+            "aggressiveness": level,
+            "method": method,
+            "files_removed": removed,
+        }
+        manifest_path(root).write_text(
+            json.dumps(tombstone, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    finally:
+        progress.close()
+
+    print()
+    if overwrite:
+        print("Files overwritten and deleted. This cannot be undone.")
+    else:
+        print("Files deleted without overwrite. Forensic recovery may still be possible.")
+    print(f"Removed: {removed}")
+    print(f"Marker: {manifest_path(root)}")
+
+
 def lock_directory(
     root: Path,
     password: str,
@@ -658,9 +990,11 @@ def lock_directory(
     cipher_name: str = CIPHER_CHACHA,
     key_file: Path | None = None,
     policy: Any | None = None,
+    aggressiveness: int | None = None,
 ) -> None:
     root = root.resolve()
     cipher_name = normalize_cipher(cipher_name)
+    level = normalize_aggressiveness(aggressiveness)
 
     if not root.is_dir():
         raise ValueError(f"Directory does not exist: {root}")
@@ -669,6 +1003,23 @@ def lock_directory(
         raise FileExistsError(
             f"Directory is already locked: {manifest_path(root)}"
         )
+
+    if level == 1:
+        _lock_read_protect(
+            root,
+            password,
+            cipher_name=cipher_name,
+            key_file=key_file,
+            policy=policy,
+        )
+        return
+    if level >= 4:
+        _destroy_directory(root, overwrite=level == 5, policy=policy)
+        return
+    if level == 2:
+        password = ""
+    elif not password:
+        raise ValueError("Standard encryption requires a password.")
 
     files = iter_target_files(
         root,
@@ -742,6 +1093,7 @@ def lock_directory(
         manifest: dict[str, Any] = {
             "version": VERSION,
             "mode": "in-place",
+            "aggressiveness": level,
             "names": {"encrypted": True},
             "kdf": {
                 "algorithm": "Argon2id",
@@ -751,6 +1103,7 @@ def lock_directory(
                 "lanes": 4,
                 "memory_cost": 64 * 1024,
                 "key_file": bool(key_file),
+                "passwordless": not bool(password),
             },
             "cipher": {
                 "algorithm": cipher_name,
@@ -799,6 +1152,8 @@ def lock_directory(
         print(f"Skipped: {skipped}")
     print(f"Cipher: {cipher_name}")
     print("Names: encrypted")
+    if not password:
+        print("Password: none (passwordless lock)")
     print(f"Manifest: {manifest_path(root)}")
 
 
@@ -820,10 +1175,11 @@ def load_locked(
     if version not in SUPPORTED_VERSIONS:
         raise ValueError(f"Unsupported vault version: {version}")
 
-    if manifest.get("mode") not in (None, "in-place"):
-        raise ValueError(
-            f"Unsupported lock mode: {manifest.get('mode')}"
-        )
+    mode = manifest.get("mode")
+    if mode == MODE_DESTROYED:
+        raise ValueError("Files were destroyed and cannot be unlocked.")
+    if mode not in (None, MODE_IN_PLACE, MODE_READ_PROTECT):
+        raise ValueError(f"Unsupported lock mode: {mode}")
 
     uses_key_file = bool(manifest.get("kdf", {}).get("key_file"))
     if uses_key_file and key_file is None:
@@ -833,12 +1189,13 @@ def load_locked(
         )
 
     salt = bytes.fromhex(manifest["kdf"]["salt"])
+    passwordless = bool(manifest.get("kdf", {}).get("passwordless"))
     algorithm = normalize_cipher(
         manifest.get("cipher", {}).get("algorithm", CIPHER_CHACHA)
     )
     spec = get_cipher_spec(algorithm)
     key = derive_key(
-        password,
+        "" if passwordless else password,
         salt,
         key_file=key_file if uses_key_file else None,
         key_size=spec.key_size,
@@ -858,7 +1215,11 @@ def password_opens(
     key_file: Path | None = None,
 ) -> bool:
     """Return True if password decrypts this locked directory's inventory."""
-    if not password or not is_locked(root):
+    if not is_locked(root) or is_destroyed_vault(root):
+        return False
+    if is_passwordless_vault(root):
+        password = ""
+    elif not password:
         return False
     try:
         load_locked(root, password, key_file=key_file)
@@ -873,6 +1234,38 @@ def verify_directory(
     *,
     key_file: Path | None = None,
 ) -> None:
+    if is_destroyed_vault(root):
+        manifest = peek_manifest(root) or {}
+        removed = manifest.get("files_removed", "?")
+        method = manifest.get("method", "delete")
+        print(f"Destroyed ({method}). {removed} file(s) removed. Nothing to verify.")
+        return
+    if is_read_protect_vault(root):
+        root, _manifest, _cipher, files, _dirs = load_locked(
+            root,
+            password,
+            key_file=key_file,
+        )
+        print("Verifying read-protected directory...")
+        print()
+        from xenon.progress import Progress
+
+        progress = Progress("Verifying", total=len(files))
+        try:
+            for entry in files:
+                relative = entry["path"]
+                progress.update(1, suffix=relative[:48])
+                path = root / relative
+                if not path.is_file():
+                    raise FileNotFoundError(f"Missing sealed file: {relative}")
+                if path.stat().st_mode & 0o777:
+                    raise ValueError(f"File is not sealed: {relative}")
+        finally:
+            progress.close()
+        print()
+        print("Verification successful.")
+        return
+
     root, _manifest, cipher, files, _dirs = load_locked(
         root,
         password,
@@ -906,6 +1299,15 @@ def unlock_directory(
     *,
     key_file: Path | None = None,
 ) -> None:
+    if is_destroyed_vault(root):
+        raise ValueError(
+            "Files were destroyed and cannot be restored. "
+            "Delete .xenon/ if you want to reuse this folder."
+        )
+    if is_read_protect_vault(root):
+        _unlock_read_protect(root, password, key_file=key_file)
+        return
+
     root, _manifest, cipher, files, dirs = load_locked(
         root,
         password,
@@ -928,19 +1330,34 @@ def unlock_directory(
     finally:
         progress.close()
 
-    path = manifest_path(root)
-    path.unlink(missing_ok=True)
-
-    meta = xenon_dir(root)
-    try:
-        next(meta.iterdir())
-    except StopIteration:
-        meta.rmdir()
-    except FileNotFoundError:
-        pass
+    _remove_manifest(root)
 
     print()
     print("Directory unlocked.")
+
+
+def rekey_directory(
+    root: Path,
+    old_password: str,
+    new_password: str,
+    *,
+    key_file: Path | None = None,
+    cipher_name: str | None = None,
+    policy: Any | None = None,
+) -> None:
+    """Unlock with old_password then lock with new_password."""
+    if is_destroyed_vault(root):
+        raise ValueError("Destroyed targets cannot be rekeyed.")
+    level = vault_aggressiveness(root)
+    unlock_directory(root, old_password, key_file=key_file)
+    lock_directory(
+        root,
+        new_password,
+        cipher_name=cipher_name or CIPHER_CHACHA,
+        key_file=key_file,
+        policy=policy,
+        aggressiveness=level,
+    )
 
 
 def generate_key_file(path: Path) -> Path:

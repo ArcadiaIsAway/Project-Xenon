@@ -6,11 +6,17 @@ import sys
 from pathlib import Path
 
 from xenon.config import (
+    aggressiveness_from_config,
     configured_targets,
+    config_password_matches,
     exclusion_policy_from_config,
     load_config,
+    password_configured,
+    save_config,
+    set_config_password,
     write_default_config,
 )
+from xenon.aggressiveness import get_level
 from xenon.desktop import install_trigger, render_trigger
 from xenon.panic import run_panic
 from xenon.probe import probe_scope
@@ -18,6 +24,9 @@ from xenon.prompt import confirm, prompt_password
 from xenon.setup_ui import run_setup
 from xenon.vault import (
     CIPHER_CHACHA,
+    is_locked,
+    is_destroyed_vault,
+    is_passwordless_vault,
     load_optional_key_file,
     lock_directory,
     unlock_directory,
@@ -35,6 +44,52 @@ def _encryption_from_config(config_file: Path | None = None):
     cipher = encryption.get("cipher") or CIPHER_CHACHA
     key_file = load_optional_key_file(encryption.get("key_file"))
     return cipher, key_file
+
+
+def _optional_config(config_file: Path | None = None) -> dict | None:
+    try:
+        return load_config(config_file)
+    except FileNotFoundError:
+        return None
+
+
+def _cli_lock_password(config: dict | None, config_file: Path | None) -> str:
+    if password_configured(config):
+        password = getpass.getpass("Password: ")
+        if not config_password_matches(config, password):
+            raise ValueError("Wrong password.")
+        return password
+
+    print("This aggressiveness level requires a password.")
+    password = getpass.getpass("New password: ")
+    confirmation = getpass.getpass("Confirm password: ")
+    if not password:
+        raise ValueError("Password cannot be empty.")
+    if password != confirmation:
+        raise ValueError("Passwords do not match.")
+    if config is not None:
+        set_config_password(config, password)
+        save_config(config, config_file)
+    return password
+
+
+def _cli_unlock_password(
+    directories: list[Path],
+    config: dict | None,
+) -> str:
+    passworded = [
+        path.expanduser()
+        for path in directories
+        if is_locked(path.expanduser())
+        and not is_passwordless_vault(path.expanduser())
+        and not is_destroyed_vault(path.expanduser())
+    ]
+    if not passworded:
+        return ""
+    password = getpass.getpass("Password: ")
+    if password_configured(config) and not config_password_matches(config, password):
+        raise ValueError("Wrong password.")
+    return password
 
 
 def _resolve_directories(
@@ -227,10 +282,22 @@ def main(argv: list[str] | None = None) -> int:
                 policy = exclusion_policy_from_config(load_config(args.config))
             except FileNotFoundError:
                 policy = exclusion_policy_from_config(None)
-            password = getpass.getpass("Master password: ")
-            confirmation = getpass.getpass("Confirm password: ")
-            if password != confirmation:
-                raise ValueError("Passwords do not match.")
+            config = _optional_config(args.config)
+            level = aggressiveness_from_config(config)
+            spec = get_level(level)
+            if spec.destructive:
+                prompt = (
+                    "Overwrite and permanently destroy files?"
+                    if spec.level == 5
+                    else "Delete files without overwriting?"
+                )
+                if not confirm(text=prompt):
+                    print("Cancelled.")
+                    return 0
+            if spec.passwordless or (spec.destructive and not spec.needs_password):
+                password = ""
+            else:
+                password = _cli_lock_password(config, args.config)
             for directory in directories:
                 print(f"Locking {directory} …")
                 lock_directory(
@@ -239,6 +306,7 @@ def main(argv: list[str] | None = None) -> int:
                     cipher_name=cipher,
                     key_file=key_file,
                     policy=policy,
+                    aggressiveness=level,
                 )
 
         elif args.command == "unlock":
@@ -246,7 +314,8 @@ def main(argv: list[str] | None = None) -> int:
             _, key_file = _encryption_from_config(args.config)
             if args.key_file:
                 key_file = args.key_file
-            password = getpass.getpass("Master password: ")
+            config = _optional_config(args.config)
+            password = _cli_unlock_password(directories, config)
             for directory in directories:
                 print(f"Unlocking {directory} …")
                 unlock_directory(
@@ -260,7 +329,8 @@ def main(argv: list[str] | None = None) -> int:
             _, key_file = _encryption_from_config(args.config)
             if args.key_file:
                 key_file = args.key_file
-            password = getpass.getpass("Master password: ")
+            config = _optional_config(args.config)
+            password = _cli_unlock_password(directories, config)
             for directory in directories:
                 print(f"Verifying {directory} …")
                 verify_directory(
@@ -294,13 +364,19 @@ def main(argv: list[str] | None = None) -> int:
                     print("Panic cancelled.")
                     return 0
 
+            config = load_config(args.config)
+            if not password_configured(config):
+                raise ValueError(
+                    "Panic requires a configured password. Set one with: xenon setup"
+                )
+
             password = prompt_password(
                 gui=args.gui,
                 title="Xenon Panic",
-                prompt="Master password:",
+                prompt="Password:",
             )
             if not password:
-                raise ValueError("Password cannot be empty.")
+                raise ValueError("Panic cannot run without a password.")
 
             run_panic(
                 password,

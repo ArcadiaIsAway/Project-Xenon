@@ -5,9 +5,12 @@ from pathlib import Path
 
 from xenon.config import (
     STATE_DIR,
+    aggressiveness_from_config,
     configured_targets,
+    config_password_matches,
     exclusion_policy_from_config,
     load_config,
+    password_configured,
 )
 from xenon.lockdown import lockdown
 from xenon.vault import CIPHER_CHACHA, is_locked, load_optional_key_file, lock_directory
@@ -39,6 +42,15 @@ def run_panic(
     config_file: Path | None = None,
 ) -> list[Path]:
     config = load_config(config_file)
+    if not password:
+        raise ValueError("Panic cannot run without a password.")
+    if not password_configured(config):
+        raise ValueError(
+            "Panic requires a configured password. Set one with: xenon setup"
+        )
+    if not config_password_matches(config, password):
+        raise ValueError("Wrong password.")
+
     override = target or source
     if override is not None:
         directories = [override.expanduser()]
@@ -85,6 +97,7 @@ def run_panic(
     cipher_name = encryption.get("cipher") or CIPHER_CHACHA
     key_file = load_optional_key_file(encryption.get("key_file"))
     policy = exclusion_policy_from_config(config)
+    level = aggressiveness_from_config(config)
 
     try:
         for directory in directories:
@@ -97,6 +110,7 @@ def run_panic(
                 cipher_name=cipher_name,
                 key_file=key_file,
                 policy=policy,
+                aggressiveness=level,
             )
             _append_log(f"Directory locked in place: {directory}")
     except Exception as exc:
