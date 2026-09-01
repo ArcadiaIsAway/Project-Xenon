@@ -1,0 +1,4 @@
+# Project Xenon panic trigger (Hyprland)
+# Optional — not required by the core CLI.
+# Requires `xenon` on PATH (run: ./scripts/install.sh)
+bind = SUPER CTRL ALT SHIFT, X, exec, xenon panic --gui
