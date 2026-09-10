@@ -349,28 +349,35 @@ def test_read_protect_roundtrip(tmp_path: Path):
 
 def test_delete_without_overwrite(tmp_path: Path):
     sample = tmp_path / "data"
-    sample.mkdir()
-    target = sample / "secret.txt"
+    nested = sample / "Photos" / "Vacation"
+    nested.mkdir(parents=True)
+    target = nested / "secret.txt"
     target.write_text("classified", encoding="utf-8")
+    empty = sample / "Empty Folder"
+    empty.mkdir()
 
     lock_directory(sample, "", aggressiveness=4)
-    assert is_destroyed_vault(sample)
     assert not target.exists()
-    with pytest.raises(ValueError, match="destroyed"):
-        unlock_directory(sample, "anything")
+    assert not nested.exists()
+    assert not (sample / "Photos").exists()
+    assert not empty.exists()
+    assert not sample.exists()
+    assert not is_destroyed_vault(sample)
 
 
 def test_secure_destruction(tmp_path: Path):
     sample = tmp_path / "data"
-    sample.mkdir()
-    target = sample / "secret.txt"
+    nested = sample / "keep" / "inner"
+    nested.mkdir(parents=True)
+    target = nested / "secret.txt"
     target.write_text("classified", encoding="utf-8")
 
     lock_directory(sample, "correct-horse", aggressiveness=5)
-    assert is_destroyed_vault(sample)
     assert not target.exists()
-    with pytest.raises(ValueError, match="destroyed"):
-        unlock_directory(sample, "correct-horse")
+    assert not nested.exists()
+    assert not (sample / "keep").exists()
+    assert not sample.exists()
+    assert not is_destroyed_vault(sample)
 
 
 def test_standard_encryption_rejects_empty_password(tmp_path: Path):

@@ -1,28 +1,35 @@
-# Optional Hyprland panic hotkey/WILL BE REMOVED FOR A MORE VERSATILE VERSION
+# Optional panic hotkey
 
-Core Xenon does not need Hyprland. This only wires a chord to `xenon panic --gui`.
+Core Xenon does not need a compositor. `xenon install-trigger` detects the
+running desktop and binds your panic chord to a PATH-independent wrapper:
+
+`~/.local/lib/xenon/panic-trigger` → `xenon panic --trigger`
+
+The chord is the authorization. There is no password prompt.
 
 ## Quick install
 
 ```bash
-xenon install-trigger --desktop hyprland
+xenon install-trigger
+```
+
+On Hyprland this writes `~/.config/hypr/xenon.conf` and sources it from
+`hyprland.conf`. Reload if the bind is not live:
+
+```bash
 hyprctl reload
 ```
 
-## Manual
+## Manual (Hyprland)
 
-Add to `hyprland.conf` (or a sourced file):
+If you prefer to bind it yourself, use the wrapper — not `xenon` on PATH:
 
 ```
-bind = SUPER CTRL ALT SHIFT, X, exec, xenon panic --gui
+bind = SUPER CTRL ALT SHIFT, X, exec, ~/.local/lib/xenon/panic-trigger
 ```
 
-If `xenon` is not on `PATH`, use the full interpreter path from your venv.
-
-Print a ready-made bind:
+Print a ready-made snippet for the detected desktop:
 
 ```bash
-xenon install-trigger --desktop hyprland --print-only
+xenon install-trigger --print-only
 ```
-
-See `xenon.conf.example` in this directory.

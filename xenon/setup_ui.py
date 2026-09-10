@@ -3,7 +3,6 @@ from __future__ import annotations
 import getpass
 import os
 import shutil
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -19,13 +18,31 @@ from xenon.config import (
     set_config_password,
     targets_from_config,
 )
+from xenon.desktop import detect_desktop, install_trigger, parse_config_chord, render_trigger
+from xenon.desktop.chord import parse_chord
+from xenon.desktop.command import wrapper_path
 from xenon.exclusions import OPTIONAL_DIR_CATALOG, PROTECTED_CATEGORIES
-from xenon.lockdown import lockdown
+from xenon.fx import (
+    ANIMATION_BY_KEY,
+    ANIMATIONS,
+    DISPLAY_MODES,
+    EFFECT_ORDERS,
+    EFFECTS,
+    PRESET_BY_KEY,
+    PRESETS,
+    Playback,
+    apply_preset,
+    describe_fx,
+    normalize_duration,
+    playback_from_config,
+    preview_panic_spectacle,
+)
+from xenon.panic import run_panic
 from xenon.probe import probe_scope
+from xenon.tui import Choice, STYLE, ask_text, clear_screen, pick, render_banner
 from xenon.vault import (
     CIPHER_CHACHA,
     CIPHER_SPECS,
-    SUPPORTED_CIPHERS,
     generate_key_file,
     is_destroyed_vault,
     is_locked,
@@ -42,82 +59,6 @@ from xenon.vault import (
 )
 
 
-BANNER_ART = r"""
-/\ \ /\ \ /\  _`\ /\ \/\ \/\  __`\/\ \/\ \    
-\ `\`\/'/'\ \ \L\_\ \ `\\ \ \ \/\ \ \ `\\ \   
- `\/ > <   \ \  _\L\ \ , ` \ \ \ \ \ \ , ` \  
-    \/'/\`\ \ \ \L\ \ \ \`\ \ \ \_\ \ \ \`\ \ 
-    /\_\\ \_\\ \____/\ \_\ \_\ \_____\ \_\ \_\
-    \/_/ \/_/ \/___/  \/_/\/_/\/_____/\/_/\/_/
-""".strip(
-    "\n"
-)
-
-# Vertical green gradient (bright → dark), 256-color.
-_BANNER_ROW = ("38;5;118", "38;5;82", "38;5;46", "38;5;40", "38;5;34", "38;5;22")
-
-
-class Style:
-    def __init__(self) -> None:
-        self.enabled = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
-
-    def wrap(self, code: str, text: str) -> str:
-        if not self.enabled:
-            return text
-        return f"\033[{code}m{text}\033[0m"
-
-    def bold(self, text: str) -> str:
-        return self.wrap("1", text)
-
-    def dim(self, text: str) -> str:
-        return self.wrap("2", text)
-
-    def cyan(self, text: str) -> str:
-        return self.wrap("96", text)
-
-    def green(self, text: str) -> str:
-        return self.wrap("92", text)
-
-    def yellow(self, text: str) -> str:
-        return self.wrap("93", text)
-
-    def red(self, text: str) -> str:
-        return self.wrap("91", text)
-
-    def magenta(self, text: str) -> str:
-        return self.wrap("95", text)
-
-
-STYLE = Style()
-
-
-def render_banner() -> str:
-    lines = BANNER_ART.splitlines()
-    width = max(len(line) for line in lines)
-    painted: list[str] = []
-
-    for index, line in enumerate(lines):
-        color = _BANNER_ROW[min(index, len(_BANNER_ROW) - 1)]
-        padded = line.ljust(width)
-        if STYLE.enabled:
-            painted.append(f"\033[1;{color}m{padded}\033[0m")
-        else:
-            painted.append(padded)
-
-    if not STYLE.enabled:
-        return "\n".join(painted)
-
-    rule = STYLE.dim("─" * (width + 2))
-    top = f"{STYLE.dim('┌')}{rule}{STYLE.dim('┐')}"
-    bottom = f"{STYLE.dim('└')}{rule}{STYLE.dim('┘')}"
-    framed = [
-        top,
-        *[f"{STYLE.dim('│')} {row} {STYLE.dim('│')}" for row in painted],
-        bottom,
-    ]
-    return "\n".join(framed)
-
-
 @dataclass
 class SetupSession:
     config: dict
@@ -130,7 +71,7 @@ class SetupSession:
 
 
 def _clear() -> None:
-    os.system("cls" if os.name == "nt" else "clear")
+    clear_screen()
 
 
 def _pause(label: str = "Press Enter to return to the menu...") -> None:
@@ -152,27 +93,39 @@ def _box_title(title: str) -> None:
     print(STYLE.dim(_rule()))
 
 
+def _trigger_status(session: SetupSession) -> str:
+    raw = (session.config.get("trigger") or {}).get("chord")
+    try:
+        chord = parse_config_chord(raw)
+    except ValueError:
+        return STYLE.yellow(str(raw or "(invalid)"))
+    desktop = (session.config.get("trigger") or {}).get("desktop") or detect_desktop()
+    if desktop and desktop != "unknown":
+        return f"{chord.display()}  {STYLE.dim(str(desktop))}"
+    return chord.display()
+
+
 def _kv(label: str, value: str) -> str:
     return f"{STYLE.dim(label.ljust(14))} {value}"
 
 
-def _status_block(session: SetupSession) -> None:
+def _chip(label: str, value: str) -> str:
+    return f"{STYLE.dim(label)} {value}"
+
+
+def _status_lines(session: SetupSession) -> list[str]:
     targets = targets_from_config(session.config)
     if not targets:
-        target_text = STYLE.yellow("(none)")
+        target_text = STYLE.yellow("none")
     elif len(targets) == 1:
         target_text = targets[0]
     else:
-        target_text = f"{len(targets)} directories — {targets[0]} …"
+        target_text = f"{len(targets)} directories"
 
-    cipher = session.config.get("encryption", {}).get("cipher")
-    key_file = session.config.get("encryption", {}).get("key_file") or STYLE.dim("(none)")
-    if _password_is_set(session):
-        password = STYLE.green("set")
-    else:
-        password = STYLE.yellow("not set")
+    cipher = session.config.get("encryption", {}).get("cipher") or "—"
+    key_file = session.config.get("encryption", {}).get("key_file")
+    password = STYLE.green("set") if _password_is_set(session) else STYLE.yellow("not set")
 
-    locked = STYLE.dim("n/a")
     locked_bits: list[str] = []
     for raw in targets:
         try:
@@ -181,56 +134,109 @@ def _status_block(session: SetupSession) -> None:
                 locked_bits.append("yes" if is_locked(root) else "no")
         except OSError:
             locked_bits.append("?")
-    if locked_bits:
-        if all(bit == "yes" for bit in locked_bits):
-            locked = STYLE.magenta("yes")
-        elif all(bit == "no" for bit in locked_bits):
-            locked = STYLE.green("no")
-        else:
-            locked = STYLE.yellow("/".join(locked_bits))
+    if not locked_bits:
+        locked = STYLE.dim("n/a")
+    elif all(bit == "yes" for bit in locked_bits):
+        locked = STYLE.magenta("locked")
+    elif all(bit == "no" for bit in locked_bits):
+        locked = STYLE.green("open")
+    else:
+        locked = STYLE.yellow("/".join(locked_bits))
 
-    print(_kv("Targets", str(target_text)))
-    print(_kv("Cipher", str(cipher)))
-    print(_kv("Aggressiveness", describe_level(aggressiveness_from_config(session.config))))
-    print(_kv("Key file", str(key_file)))
-    print(_kv("Password", password))
-    print(_kv("Locked", locked))
-    print(_kv("Config", str(session.config_file)))
-
-
-def _render_menu(session: SetupSession) -> None:
-    _clear()
-    _box_title("Setup  ·  configure targets, crypto, and readiness")
-    _status_block(session)
-    print(STYLE.dim(_rule()))
-
+    lines = [
+        "  ".join(
+            [
+                _chip("Targets", str(target_text)),
+                _chip("Password", password),
+                _chip("Vaults", locked),
+            ]
+        ),
+        "  ".join(
+            [
+                _chip("Crypto", f"{cipher} · {describe_level(aggressiveness_from_config(session.config))}"),
+                _chip("Key", str(key_file) if key_file else STYLE.dim("none")),
+            ]
+        ),
+        "  ".join(
+            [
+                _chip("Panic", _trigger_status(session)),
+                _chip("FX", describe_fx(session.config)),
+            ]
+        ),
+    ]
     if session.message:
         if session.message_ok is True:
-            print(STYLE.green(session.message))
+            lines.append(STYLE.green(session.message))
         elif session.message_ok is False:
-            print(STYLE.red(session.message))
+            lines.append(STYLE.red(session.message))
         else:
-            print(STYLE.yellow(session.message))
-        print(STYLE.dim(_rule()))
+            lines.append(STYLE.yellow(session.message))
         session.message = ""
         session.message_ok = None
+    return lines
 
-    print()
-    items = [
-        ("1", "Manage targets and preview files"),
-        ("2", "Set / change password"),
-        ("3", "Verify encryption readiness"),
-        ("4", "Define encryption type and aggressiveness"),
-        ("5", "Define encryption key (optional)"),
-        ("6", "Manage exclusions"),
-        ("7", "Exit"),
+
+def _status_block(session: SetupSession) -> None:
+    for line in _status_lines(session):
+        print(line)
+
+
+def _home_choices(session: SetupSession) -> list[Choice]:
+    targets = targets_from_config(session.config)
+    n = len(targets)
+    playback = describe_fx(session.config)
+    return [
+        Choice(
+            "targets",
+            "Targets",
+            f"{n} director{'y' if n == 1 else 'ies'} to lock",
+            group="Vault",
+            shortcut="1",
+        ),
+        Choice(
+            "password",
+            "Password",
+            "set" if _password_is_set(session) else "not set yet",
+            group="Vault",
+            shortcut="2",
+        ),
+        Choice(
+            "verify",
+            "Readiness",
+            "probe whether files can be sealed",
+            group="Vault",
+            shortcut="3",
+        ),
+        Choice(
+            "crypto",
+            "Cipher & level",
+            describe_level(aggressiveness_from_config(session.config)),
+            group="Crypto",
+            shortcut="4",
+        ),
+        Choice(
+            "key",
+            "Key file",
+            "optional extra secret",
+            group="Crypto",
+            shortcut="5",
+        ),
+        Choice(
+            "exclusions",
+            "Exclusions",
+            "skip caches, repos, and custom paths",
+            group="Crypto",
+            shortcut="6",
+        ),
+        Choice(
+            "panic",
+            "Panic",
+            playback,
+            group="Panic",
+            shortcut="7",
+        ),
+        Choice("exit", "Exit", "leave setup", group="Session", shortcut="8"),
     ]
-    for number, label in items:
-        print(f"  {STYLE.cyan(number)})  {label}")
-
-    print()
-    print(STYLE.dim("Ctrl+C to quit at any time."))
-    print()
 
 
 def _human_size(num: int) -> str:
@@ -519,24 +525,6 @@ def _ensure_unlock_password(
     return _require_existing_password(session, roots=passworded)
 
 
-def _ensure_panic_password(session: SetupSession) -> str | None:
-    if not password_configured(session.config):
-        print(
-            STYLE.red(
-                "Panic requires a password. Set one from menu option 2 first."
-            )
-        )
-        print(STYLE.dim("Panic will not run without a password."))
-        return None
-    password = getpass.getpass("Password: ")
-    if not password or not config_password_matches(session.config, password):
-        print(STYLE.red("Wrong password."))
-        print(STYLE.red("Panic cannot run without a password."))
-        return None
-    _remember_verified(session, password)
-    return password
-
-
 def _session_crypto(session: SetupSession):
     encryption = session.config.get("encryption") or {}
     cipher = encryption.get("cipher") or CIPHER_CHACHA
@@ -735,7 +723,15 @@ def _run_panic_targets(session: SetupSession, selected: list[str]) -> None:
     print(STYLE.red(STYLE.bold("Panic")))
     spec = get_level(aggressiveness_from_config(session.config))
     print(f"  Action: {spec.title} — {spec.summary}")
+    if spec.needs_password and not spec.destructive:
+        print(
+            STYLE.dim(
+                "  Hotkey/setup panic does not prompt for a password; "
+                "this level falls back to passwordless encryption."
+            )
+        )
     print(f"  Targets: {', '.join(selected)}")
+    print(f"  Spectacle: {describe_fx(session.config)}")
     print(f"  Screen lock: {'yes' if lock_screen else 'no'}")
     print(f"  Kill session: {'yes' if kill_session else 'no'}")
     print()
@@ -745,219 +741,178 @@ def _run_panic_targets(session: SetupSession, selected: list[str]) -> None:
         _pause()
         return
 
-    password = _ensure_panic_password(session)
-    if password is None:
-        _pause()
-        return
-
-    backend = lockdown_cfg.get("backend", "auto")
-    lock_command = lockdown_cfg.get("lock_command")
-    kill_command = lockdown_cfg.get("kill_command")
-
-    if lock_screen:
-        lockdown(
-            backend=backend,
-            lock_screen=True,
-            kill_session=False,
-            lock_command=lock_command,
-            kill_command=kill_command,
-        )
-
-    cipher, key_file, policy = _session_crypto(session)
-    failed = False
     try:
-        for raw in selected:
-            root = Path(raw).expanduser()
-            print()
-            print(STYLE.bold(f"Panic lock  {root}"))
-            if not root.is_dir():
-                print(STYLE.red("Not a directory."))
-                failed = True
-                continue
-            if is_locked(root):
-                print(STYLE.yellow("Already locked — skipped."))
-                continue
-            lock_directory(
-                root,
-                password,
-                cipher_name=cipher,
-                key_file=key_file,
-                policy=policy,
-                aggressiveness=aggressiveness_from_config(session.config),
-            )
+        run_panic(
+            "",
+            triggered=True,
+            directories=[Path(raw) for raw in selected],
+            config=session.config,
+            config_file=session.config_file,
+        )
     except Exception as exc:
-        print(STYLE.red(f"Lock failed: {exc}"))
-        failed = True
-        if kill_session:
-            lockdown(
-                backend=backend,
-                lock_screen=False,
-                kill_session=True,
-                lock_command=lock_command,
-                kill_command=kill_command,
-            )
+        print(STYLE.red(f"Panic failed: {exc}"))
         _pause()
         return
-
-    _remember_verified(session, password)
-
-    if kill_session:
-        lockdown(
-            backend=backend,
-            lock_screen=False,
-            kill_session=True,
-            lock_command=lock_command,
-            kill_command=kill_command,
-        )
 
     print()
-    if failed:
-        print(STYLE.red("Panic finished with errors."))
-    else:
-        print(STYLE.green("Panic complete."))
+    print(STYLE.green("Panic complete."))
     _pause()
 
 
 def action_manage_targets(session: SetupSession) -> None:
     while True:
-        _clear()
-        _box_title("Manage targets")
-        print(
-            STYLE.dim(
-                "Targets are directories Xenon will encrypt in place "
-                "(lock / unlock / panic / check)."
-            )
-        )
-        print(STYLE.dim("Omit N to apply lock / unlock / check / panic to every target."))
-        print(STYLE.dim(_rule("·")))
-
         targets = list(targets_from_config(session.config))
-        if not targets:
-            print(STYLE.yellow("  (no targets configured)"))
-        else:
-            for index, raw in enumerate(targets, 1):
-                path = Path(raw).expanduser()
-                mark = _target_status_mark(path)
-                print(f"  {STYLE.cyan(f'{index:>2}')}  [{mark}]  {raw}")
-
-        print()
-        print(STYLE.dim(_rule("·")))
-        print(
-            f"  {STYLE.cyan('a')} add   "
-            f"{STYLE.cyan('d N')} remove   "
-            f"{STYLE.cyan('p N')} preview   "
-            f"{STYLE.cyan('s')} save   "
-            f"{STYLE.cyan('b')} back"
+        header = _target_list_header(targets)
+        items = [
+            Choice("add", "Add directory", "new encryption target", group="Edit", shortcut="a"),
+        ]
+        if targets:
+            items.append(
+                Choice(
+                    "one",
+                    "Choose a target…",
+                    "preview, lock, unlock, remove",
+                    group="Edit",
+                    shortcut="t",
+                )
+            )
+            items.extend(
+                [
+                    Choice("lock", "Lock all", group="Every target", shortcut="l"),
+                    Choice("unlock", "Unlock all", group="Every target", shortcut="u"),
+                    Choice("check", "Check all", group="Every target", shortcut="c"),
+                    Choice("panic", "Panic all", "uses the hotkey path", group="Every target", shortcut="!"),
+                ]
+            )
+        items.append(Choice("back", "Back", group="Session", shortcut="b"))
+        choice = pick(
+            "Targets",
+            items,
+            subtitle="Directories Xenon encrypts in place.",
+            header=header,
         )
-        print(
-            f"  {STYLE.cyan('l')} [N] lock   "
-            f"{STYLE.cyan('u')} [N] unlock   "
-            f"{STYLE.cyan('c')} [N] check   "
-            f"{STYLE.cyan('!')} [N] panic"
-        )
-        print()
-        choice = input(STYLE.cyan("Targets › ")).strip().lower()
-
-        if choice in {"b", "back", "q", "quit", ""}:
+        if choice in {None, "back"}:
             return
-
-        if choice in {"s", "save"}:
-            session.config["targets"] = targets
-            session.config.pop("source", None)
-            save_config(session.config, session.config_file)
-            print(STYLE.green("Saved."))
-            _pause()
-            session.message = f"{len(targets)} target(s) saved."
-            session.message_ok = True
-            return
-
-        if choice in {"a", "add"}:
-            raw = input(STYLE.cyan("Target directory › ")).strip()
-            if not raw:
-                continue
-            root = Path(raw).expanduser().resolve()
-            if not root.is_dir():
-                print(STYLE.red(f"Not a directory: {root}"))
-                _pause()
-                continue
-            text = str(root)
-            existing = {str(Path(t).expanduser()) for t in targets}
-            if str(root) in existing or text in existing:
-                print(STYLE.yellow("Already listed."))
-                _pause()
-                continue
-            targets.append(text)
-            session.config["targets"] = targets
-            session.config.pop("source", None)
-            save_config(session.config, session.config_file)
-            count, _ = _preview_target(session, root)
-            print()
-            print(STYLE.green(f"Added target → {root}"))
-            _pause()
-            session.message = f"Added target {root} ({count:,} files)."
-            session.message_ok = True
+        if choice == "add":
+            _add_target(session)
+            continue
+        if choice == "one":
+            _act_on_one_target(session)
+            continue
+        if choice == "lock":
+            _run_lock_targets(session, targets)
+            continue
+        if choice == "unlock":
+            _run_unlock_targets(session, targets)
+            continue
+        if choice == "check":
+            _run_check_targets(session, targets)
+            continue
+        if choice == "panic":
+            _run_panic_targets(session, targets)
             continue
 
-        parsed = _split_target_command(choice)
-        if parsed is None:
-            print(STYLE.red("Unknown command."))
-            _pause()
-            continue
 
-        verb, index = parsed
-        if verb in _INDEX_REQUIRED and index is None:
-            print(STYLE.red(f"Specify a target number, e.g. {verb} 1"))
-            _pause()
-            continue
+def _target_list_header(targets: list[str]) -> list[str]:
+    if not targets:
+        return [STYLE.yellow("No targets yet. Add a directory to get started.")]
+    lines = []
+    for index, raw in enumerate(targets, 1):
+        path = Path(raw).expanduser()
+        mark = _target_status_mark(path)
+        lines.append(f"  {STYLE.cyan(f'{index:>2}')}  [{mark}]  {raw}")
+    return lines
 
-        try:
-            selected = _select_targets(targets, index)
-        except ValueError as exc:
-            print(STYLE.red(str(exc)))
-            _pause()
-            continue
 
-        if verb in {"d", "rm", "remove"}:
-            assert index is not None
-            removed = targets.pop(index - 1)
-            session.config["targets"] = targets
-            session.config.pop("source", None)
-            save_config(session.config, session.config_file)
-            print(STYLE.green(f"Removed: {removed}"))
-            _pause()
-            session.message = f"Removed target {removed}."
-            session.message_ok = True
-            continue
-
-        if verb in {"p", "preview"}:
-            root = Path(selected[0]).expanduser()
-            if not root.is_dir():
-                print(STYLE.red(f"Not a directory: {root}"))
-                _pause()
-                continue
-            _preview_target(session, root)
-            print()
-            _pause()
-            continue
-
-        if verb in {"l", "lock"}:
-            _run_lock_targets(session, selected)
-            continue
-
-        if verb in {"u", "unlock"}:
-            _run_unlock_targets(session, selected)
-            continue
-
-        if verb in {"c", "check"}:
-            _run_check_targets(session, selected)
-            continue
-
-        if verb in {"!", "panic"}:
-            _run_panic_targets(session, selected)
-            continue
-
-        print(STYLE.red("Unknown command."))
+def _add_target(session: SetupSession) -> None:
+    raw = ask_text("Directory to encrypt")
+    if not raw:
+        return
+    root = Path(raw).expanduser().resolve()
+    if not root.is_dir():
+        print(STYLE.red(f"Not a directory: {root}"))
         _pause()
+        return
+    targets = list(targets_from_config(session.config))
+    existing = {str(Path(item).expanduser()) for item in targets}
+    text = str(root)
+    if str(root) in existing or text in existing:
+        print(STYLE.yellow("Already listed."))
+        _pause()
+        return
+    targets.append(text)
+    session.config["targets"] = targets
+    session.config.pop("source", None)
+    save_config(session.config, session.config_file)
+    count, _ = _preview_target(session, root)
+    print()
+    print(STYLE.green(f"Added target → {root}"))
+    _pause()
+    session.message = f"Added {root} ({count:,} files)."
+    session.message_ok = True
+
+
+def _act_on_one_target(session: SetupSession) -> None:
+    targets = list(targets_from_config(session.config))
+    if not targets:
+        return
+    picked = pick(
+        "Choose a target",
+        [
+            Choice(
+                str(index),
+                raw,
+                _target_status_mark(Path(raw).expanduser()),
+            )
+            for index, raw in enumerate(targets, 1)
+        ],
+        subtitle="Then pick what to do with it.",
+    )
+    if picked is None:
+        return
+    index = int(picked)
+    selected = [targets[index - 1]]
+    raw = selected[0]
+    action = pick(
+        raw,
+        [
+            Choice("preview", "Preview files", "list what would be sealed", shortcut="p"),
+            Choice("lock", "Lock", shortcut="l"),
+            Choice("unlock", "Unlock", shortcut="u"),
+            Choice("check", "Check readiness", shortcut="c"),
+            Choice("panic", "Panic this target", danger=True, shortcut="!"),
+            Choice("remove", "Remove from list", danger=True, shortcut="d"),
+            Choice("back", "Back", shortcut="b"),
+        ],
+    )
+    if action in {None, "back"}:
+        return
+    if action == "remove":
+        removed = targets.pop(index - 1)
+        session.config["targets"] = targets
+        session.config.pop("source", None)
+        save_config(session.config, session.config_file)
+        session.message = f"Removed {removed}."
+        session.message_ok = True
+        return
+    if action == "preview":
+        root = Path(raw).expanduser()
+        if not root.is_dir():
+            print(STYLE.red(f"Not a directory: {root}"))
+            _pause()
+            return
+        _preview_target(session, root)
+        print()
+        _pause()
+        return
+    if action == "lock":
+        _run_lock_targets(session, selected)
+    elif action == "unlock":
+        _run_unlock_targets(session, selected)
+    elif action == "check":
+        _run_check_targets(session, selected)
+    elif action == "panic":
+        _run_panic_targets(session, selected)
 
 
 def action_set_password(session: SetupSession) -> None:
@@ -965,8 +920,9 @@ def action_set_password(session: SetupSession) -> None:
     _box_title("Set / change password")
     print(
         STYLE.dim(
-            "This password locks, unlocks, and is required for panic. "
-            "It is stored as a verifier in config, never as plaintext."
+            "This password locks and unlocks targets. Panic uses your hotkey "
+            "instead of this password. It is stored as a verifier in config, "
+            "never as plaintext."
         )
     )
     print()
@@ -1377,8 +1333,6 @@ def _remediate_probe_issues(session: SetupSession, reports: list) -> bool:
 
 
 def action_encryption_type(session: SetupSession) -> None:
-    _clear()
-    _box_title("Encryption type and aggressiveness")
     encryption = session.config.setdefault("encryption", {})
     current_level = aggressiveness_from_config(session.config)
     current_cipher = encryption.get("cipher")
@@ -1387,46 +1341,31 @@ def action_encryption_type(session: SetupSession) -> None:
     except ValueError:
         current_name = current_cipher
 
-    print(_kv("Aggressiveness", describe_level(current_level)))
-    print(_kv("Cipher", str(current_cipher)))
-    print()
-    print(STYLE.bold("Aggressiveness"))
-    print(STYLE.dim("Controls what lock / panic do to target files."))
-    print()
-    for spec in LEVELS:
-        marker = STYLE.green("  ← current") if spec.level == current_level else ""
-        risk = STYLE.red(" irreversible") if spec.destructive else ""
-        print(
-            f"  {STYLE.cyan(str(spec.level))}) {spec.title}{risk}{marker}"
-        )
-        print(f"      {STYLE.dim(spec.summary)}")
-    print()
-    print(STYLE.bold("Cipher"))
-    print(STYLE.dim("Used when encrypting (levels 2 and 3)."))
-    print()
-    width = max(len(item.name) for item in CIPHER_SPECS)
-    for index, spec in enumerate(CIPHER_SPECS, 1):
-        marker = STYLE.green("  ← current") if spec.name == current_name else ""
-        print(
-            f"  {STYLE.cyan(str(index))}) {spec.name.ljust(width)}  "
-            f"{STYLE.dim(spec.summary)}{marker}"
-        )
-    print()
-    print(STYLE.dim("Enter to keep a value unchanged."))
-
-    raw_level = input(STYLE.cyan("Aggressiveness [1-5] › ")).strip()
-    if raw_level:
-        try:
-            new_level = int(raw_level)
-            spec = get_level(new_level)
-        except (TypeError, ValueError):
-            session.message = "Invalid aggressiveness. Choose 1-5."
-            session.message_ok = False
-            return
+    level_key = pick(
+        "Aggressiveness",
+        [
+            Choice(
+                str(spec.level),
+                spec.title,
+                spec.summary,
+                current=spec.level == current_level,
+                danger=spec.destructive,
+                shortcut=str(spec.level),
+            )
+            for spec in LEVELS
+        ],
+        subtitle="What lock and panic do to target files. Enter keeps the current level.",
+        header=[
+            _kv("Current", describe_level(current_level)),
+            _kv("Cipher", str(current_cipher)),
+        ],
+    )
+    if level_key is not None:
+        spec = get_level(int(level_key))
         if spec.level == 5 and spec.level != current_level:
             if not password_configured(session.config):
                 session.message = (
-                    "Level 5 requires a password. Set one from menu option 2 first."
+                    "Level 5 requires a password. Set one from Password first."
                 )
                 session.message_ok = False
                 return
@@ -1449,23 +1388,22 @@ def action_encryption_type(session: SetupSession) -> None:
         encryption["aggressiveness"] = spec.level
         current_level = spec.level
 
-    raw_cipher = input(STYLE.cyan("Cipher [number or name] › ")).strip()
-    if raw_cipher:
-        selected: str | None = None
-        try:
-            index = int(raw_cipher)
-            if 1 <= index <= len(SUPPORTED_CIPHERS):
-                selected = SUPPORTED_CIPHERS[index - 1]
-        except ValueError:
-            pass
-        if selected is None:
-            try:
-                selected = normalize_cipher(raw_cipher)
-            except ValueError:
-                session.message = "Invalid cipher selection."
-                session.message_ok = False
-                return
-        encryption["cipher"] = normalize_cipher(selected)
+    cipher_key = pick(
+        "Cipher",
+        [
+            Choice(
+                spec.name,
+                spec.name,
+                spec.summary,
+                current=spec.name == current_name,
+                shortcut=str(index),
+            )
+            for index, spec in enumerate(CIPHER_SPECS, 1)
+        ],
+        subtitle="Used when encrypting (levels 2 and 3). Enter keeps the current cipher.",
+    )
+    if cipher_key is not None:
+        encryption["cipher"] = normalize_cipher(cipher_key)
 
     save_config(session.config, session.config_file)
     session.message = (
@@ -1476,24 +1414,24 @@ def action_encryption_type(session: SetupSession) -> None:
 
 
 def action_encryption_key(session: SetupSession) -> None:
-    _clear()
-    _box_title("Define encryption key (optional)")
-    print(STYLE.dim("Mixed with your password via HKDF. Leave unset for password-only."))
-    print()
     current = session.config.get("encryption", {}).get("key_file")
-    print(_kv("Current", str(current or STYLE.dim("(none)"))))
-    print()
-    print(f"  {STYLE.cyan('1')}) Set path to an existing key file")
-    print(f"  {STYLE.cyan('2')}) Generate a new key file")
-    print(f"  {STYLE.cyan('3')}) Clear optional key file")
-    print(f"  {STYLE.cyan('4')}) Cancel")
-    print()
-    choice = input(STYLE.cyan("Select › ")).strip()
-
+    choice = pick(
+        "Optional key file",
+        [
+            Choice("set", "Use an existing file", shortcut="1"),
+            Choice("new", "Generate a new key file", shortcut="2"),
+            Choice("clear", "Clear optional key file", shortcut="3"),
+            Choice("back", "Back", shortcut="4"),
+        ],
+        subtitle="Mixed with your password via HKDF. Leave unset for password-only.",
+        header=[_kv("Current", str(current or STYLE.dim("none")))],
+    )
     encryption = session.config.setdefault("encryption", {})
-
-    if choice == "1":
-        raw = input(STYLE.cyan("Path to key file › ")).strip()
+    if choice in {None, "back"}:
+        session.message = "Key file unchanged."
+        return
+    if choice == "set":
+        raw = ask_text("Path to key file")
         if not raw:
             session.message = "Key file unchanged."
             return
@@ -1506,11 +1444,11 @@ def action_encryption_key(session: SetupSession) -> None:
         save_config(session.config, session.config_file)
         session.message = f"Key file set: {path}"
         session.message_ok = True
-
-    elif choice == "2":
+        return
+    if choice == "new":
         default = Path.home() / ".config" / "xenon" / "xenon.key"
-        raw = input(STYLE.cyan(f"Create key file at [{default}] › ")).strip()
-        path = Path(raw).expanduser() if raw else default
+        raw = ask_text("Create key file at", default=str(default))
+        path = Path(raw).expanduser()
         try:
             generate_key_file(path)
         except Exception as exc:
@@ -1521,144 +1459,472 @@ def action_encryption_key(session: SetupSession) -> None:
         save_config(session.config, session.config_file)
         session.message = f"Generated key file: {path.resolve()}"
         session.message_ok = True
+        return
+    encryption["key_file"] = None
+    save_config(session.config, session.config_file)
+    session.message = "Optional key file cleared."
+    session.message_ok = True
 
-    elif choice == "3":
-        encryption["key_file"] = None
-        save_config(session.config, session.config_file)
-        session.message = "Optional key file cleared."
-        session.message_ok = True
 
-    else:
-        session.message = "Key file unchanged."
+def action_panic_hotkey(session: SetupSession) -> None:
+    while True:
+        raw = (session.config.get("trigger") or {}).get("chord")
+        try:
+            chord = parse_config_chord(raw)
+            chord_text = chord.display()
+        except ValueError:
+            chord_text = str(raw or "(unset)")
+        desktop = (session.config.get("trigger") or {}).get("desktop")
+        detected = detect_desktop()
+        playback = playback_from_config(session.config)
+        preset_title = (
+            PRESET_BY_KEY[playback.preset].title
+            if playback.preset in PRESET_BY_KEY
+            else "Custom"
+        )
+        header = [
+            STYLE.dim("The chord runs panic immediately — no password."),
+            _kv("Chord", chord_text),
+            _kv("Desktop", f"{detected}  {STYLE.dim(str(desktop or 'auto'))}"),
+            _kv("Preset", preset_title),
+            _kv("Playback", describe_fx(session.config)),
+        ]
+        if playback.music:
+            header.append(_kv("Music", playback.music))
+        if playback.poweroff_after_track:
+            header.append(_kv("After track", STYLE.red("power off")))
+        choice = pick(
+            "Panic",
+            [
+                Choice("chord", "Set hotkey", "example Super+Ctrl+Alt+Shift+X", group="Hotkey", shortcut="1"),
+                Choice("install", "Install binding", "current desktop session", group="Hotkey", shortcut="2"),
+                Choice("snippet", "Show bind snippet", group="Hotkey", shortcut="3"),
+                Choice("preset", "Choose preset", preset_title, group="Spectacle", shortcut="4"),
+                Choice("playback", "Customize playback", describe_fx(session.config), group="Spectacle", shortcut="5"),
+                Choice("preview", "Preview", "no lock, no shutdown — Enter exits", group="Spectacle", shortcut="6"),
+                Choice("back", "Back", group="Session", shortcut="7"),
+            ],
+            subtitle="Hotkey, presets, and how the spectacle plays.",
+            header=header,
+        )
+        if choice in {None, "back"}:
+            return
+        if choice == "chord":
+            typed = ask_text("New chord")
+            if not typed:
+                continue
+            try:
+                parsed = parse_chord(typed)
+            except ValueError as exc:
+                print(STYLE.red(str(exc)))
+                _pause()
+                continue
+            session.config.setdefault("trigger", {})["chord"] = parsed.display()
+            save_config(session.config, session.config_file)
+            session.message = f"Panic hotkey set to {parsed.display()}."
+            session.message_ok = True
+            print(STYLE.green(session.message))
+            bind = pick(
+                "Install this binding now?",
+                [
+                    Choice("yes", "Yes, install on this desktop", shortcut="y"),
+                    Choice("no", "Not now", shortcut="n"),
+                ],
+                allow_back=True,
+            )
+            if bind == "yes":
+                _install_session_trigger(session)
+            continue
+        if choice == "install":
+            _install_session_trigger(session)
+            continue
+        if choice == "snippet":
+            print()
+            print(
+                render_trigger(
+                    desktop or "auto",
+                    chord=raw,
+                    command=str(wrapper_path()),
+                ),
+                end="",
+            )
+            print()
+            _pause()
+            continue
+        if choice == "preset":
+            _choose_panic_preset(session)
+            continue
+        if choice == "playback":
+            _customize_panic_playback(session)
+            continue
+        if choice == "preview":
+            _run_fx_preview(session)
+            continue
+
+
+def _save_playback(session: SetupSession, playback: Playback) -> None:
+    session.config["panic"] = playback.as_config()
+    save_config(session.config, session.config_file)
+
+
+def _mark_custom(playback: Playback) -> Playback:
+    playback.preset = "custom"
+    return playback
+
+
+def _choose_panic_preset(session: SetupSession) -> None:
+    current = playback_from_config(session.config)
+    selected = pick(
+        "Panic preset",
+        [
+            Choice(
+                spec.key,
+                spec.title,
+                spec.summary,
+                current=spec.key == current.preset,
+                danger=spec.playback.poweroff_after_track,
+                shortcut=str(index),
+            )
+            for index, spec in enumerate(PRESETS, 1)
+        ],
+        subtitle="Fills animation, effects, display, and shutdown. Your music file is kept.",
+    )
+    if selected is None:
+        return
+    playback = apply_preset(selected, music=current.music)
+    _save_playback(session, playback)
+    print(STYLE.green(f"Preset → {PRESET_BY_KEY[selected].title}"))
+    if playback.poweroff_after_track:
+        print(STYLE.red("This preset powers off after the track. Preview will not."))
+    _pause()
+
+
+def _choose_panic_animation(session: SetupSession) -> None:
+    playback = playback_from_config(session.config)
+    selected = pick(
+        "Animation",
+        [
+            Choice(
+                spec.key,
+                spec.title,
+                spec.summary,
+                current=spec.key == playback.animation,
+                shortcut=str(index),
+            )
+            for index, spec in enumerate(ANIMATIONS, 1)
+        ],
+    )
+    if selected is None:
+        return
+    playback.animation = selected
+    _save_playback(session, _mark_custom(playback))
+
+
+def _toggle_panic_effects(session: SetupSession) -> None:
+    while True:
+        playback = playback_from_config(session.config)
+        enabled_set = set(playback.effects)
+        items = [
+            Choice(
+                spec.key,
+                spec.title,
+                ("on · " if spec.key in enabled_set else "off · ") + spec.summary,
+                current=spec.key in enabled_set,
+                shortcut=str(index),
+            )
+            for index, spec in enumerate(EFFECTS, 1)
+        ]
+        items.append(Choice("done", "Done", shortcut="b"))
+        picked = pick(
+            "Extra effects",
+            items,
+            subtitle="Select an effect to toggle. Music is configured separately.",
+        )
+        if picked in {None, "done"}:
+            playback.effects = [spec.key for spec in EFFECTS if spec.key in enabled_set]
+            _save_playback(session, _mark_custom(playback))
+            return
+        if picked in enabled_set:
+            enabled_set.remove(picked)
+        else:
+            enabled_set.add(picked)
+        playback.effects = [spec.key for spec in EFFECTS if spec.key in enabled_set]
+        _save_playback(session, _mark_custom(playback))
+
+
+def _customize_panic_playback(session: SetupSession) -> None:
+    while True:
+        playback = playback_from_config(session.config)
+        choice = pick(
+            "Playback",
+            [
+                Choice(
+                    "animation",
+                    "Animation",
+                    ANIMATION_BY_KEY[playback.animation].title,
+                    group="Look",
+                ),
+                Choice(
+                    "effects",
+                    "Extra effects",
+                    ", ".join(playback.effects) if playback.effects else "none",
+                    group="Look",
+                ),
+                Choice(
+                    "display",
+                    "Display",
+                    playback.display,
+                    group="Look",
+                ),
+                Choice(
+                    "scripts",
+                    "Script flash",
+                    "on" if playback.script_flash else "off",
+                    group="Look",
+                ),
+                Choice(
+                    "order",
+                    "Effect order",
+                    playback.effect_order,
+                    group="Look",
+                ),
+                Choice(
+                    "duration",
+                    "Duration",
+                    f"{playback.duration:.1f}s",
+                    group="Timing",
+                ),
+                Choice(
+                    "music",
+                    "Music file",
+                    playback.music or "built-in siren if sound is on",
+                    group="Timing",
+                ),
+                Choice(
+                    "wait",
+                    "Wait for track",
+                    "yes" if playback.wait_for_music else "no",
+                    group="Timing",
+                ),
+                Choice(
+                    "poweroff",
+                    "Power off after track",
+                    "yes" if playback.poweroff_after_track else "no",
+                    group="Timing",
+                    danger=playback.poweroff_after_track,
+                ),
+                Choice("preview", "Preview", "no lock, no shutdown", group="Session"),
+                Choice("back", "Back", group="Session"),
+            ],
+            subtitle="Select a row to change it. Enter or Esc goes back.",
+        )
+        if choice in {None, "back"}:
+            return
+        if choice == "animation":
+            _choose_panic_animation(session)
+            continue
+        if choice == "effects":
+            _toggle_panic_effects(session)
+            continue
+        if choice == "duration":
+            raw = ask_text("Duration in seconds [0.8–30]")
+            if not raw:
+                continue
+            try:
+                playback.duration = normalize_duration(float(raw))
+            except ValueError:
+                print(STYLE.red("Not a number."))
+                _pause()
+                continue
+            _save_playback(session, _mark_custom(playback))
+            continue
+        if choice == "display":
+            selected = pick(
+                "Display",
+                [
+                    Choice(key, title, summary, current=key == playback.display, shortcut=str(index))
+                    for index, (key, title, summary) in enumerate(DISPLAY_MODES, 1)
+                ],
+            )
+            if selected is None:
+                continue
+            playback.display = selected
+            _save_playback(session, _mark_custom(playback))
+            continue
+        if choice == "music":
+            raw = ask_text("Music file (empty clears)")
+            if not raw:
+                playback.music = ""
+            else:
+                path = Path(raw).expanduser()
+                if not path.is_file():
+                    print(STYLE.red(f"File not found: {path}"))
+                    _pause()
+                    continue
+                playback.music = str(path)
+            _save_playback(session, _mark_custom(playback))
+            continue
+        if choice == "wait":
+            playback.wait_for_music = not playback.wait_for_music
+            _save_playback(session, _mark_custom(playback))
+            continue
+        if choice == "poweroff":
+            playback.poweroff_after_track = not playback.poweroff_after_track
+            _save_playback(session, _mark_custom(playback))
+            if playback.poweroff_after_track:
+                print(STYLE.red("The machine will power off after panic + track. Preview will not."))
+                _pause()
+            continue
+        if choice == "scripts":
+            playback.script_flash = not playback.script_flash
+            if playback.script_flash and playback.display == "overlay":
+                playback.display = "tty"
+            _save_playback(session, _mark_custom(playback))
+            continue
+        if choice == "order":
+            selected = pick(
+                "Effect order",
+                [
+                    Choice(key, title, summary, current=key == playback.effect_order, shortcut=str(index))
+                    for index, (key, title, summary) in enumerate(EFFECT_ORDERS, 1)
+                ],
+            )
+            if selected is None:
+                continue
+            playback.effect_order = selected
+            _save_playback(session, _mark_custom(playback))
+            continue
+        if choice == "preview":
+            _run_fx_preview(session)
+            continue
+
+
+def _run_fx_preview(session: SetupSession) -> None:
+    print()
+    print(
+        STYLE.yellow(
+            "Preview only — no lock, no wipe, no session kill, no shutdown."
+        )
+    )
+    playback = playback_from_config(session.config)
+    if playback.poweroff_after_track:
+        print(STYLE.red("Power-off after track is configured and will be skipped."))
+    print(STYLE.dim(f"Playing: {describe_fx(session.config)}  — Enter or Esc exits."))
+    try:
+        preview_panic_spectacle(session.config)
+    except Exception as exc:
+        print(STYLE.red(f"Preview failed: {exc}"))
+    _pause()
+
+
+def _install_session_trigger(session: SetupSession) -> None:
+    raw = (session.config.get("trigger") or {}).get("chord")
+    try:
+        path = install_trigger("auto", chord=raw, ensure_config=False, config_file=session.config_file)
+    except Exception as exc:
+        session.message = f"Could not install panic hotkey: {exc}"
+        session.message_ok = False
+        print(STYLE.red(session.message))
+        _pause()
+        return
+    detected = detect_desktop()
+    session.config.setdefault("trigger", {})["desktop"] = detected
+    save_config(session.config, session.config_file)
+    session.message = (
+        f"Panic hotkey installed for {detected} → {path}. "
+        f"Wrapper: {wrapper_path()}"
+    )
+    session.message_ok = True
+    print(STYLE.green(session.message))
+    if detected == "unknown":
+        print(
+            STYLE.yellow(
+                "Desktop was not detected. Bind the wrapper path in your "
+                "compositor or desktop settings."
+            )
+        )
+    _pause()
 
 
 def action_manage_exclusions(session: SetupSession) -> None:
     policy = exclusion_policy_from_config(session.config)
     page = 0
-    page_size = 18
+    page_size = 8
 
     while True:
-        _clear()
-        _box_title("Manage exclusions")
-        print(STYLE.bold("Protected (always skipped — cannot be toggled)"))
-        print(STYLE.dim("These keep the OS, session, and Xenon itself runnable."))
-        print()
-        for title, detail in PROTECTED_CATEGORIES:
-            print(f"  {STYLE.green('✓')} {STYLE.bold(title)}")
-            print(f"      {STYLE.dim(detail)}")
-        print()
-
         names = sorted(OPTIONAL_DIR_CATALOG.keys())
         total_pages = max(1, (len(names) + page_size - 1) // page_size)
         page = max(0, min(page, total_pages - 1))
         start = page * page_size
         chunk = names[start : start + page_size]
-
-        print(
-            STYLE.bold("Optional directory names")
-            + STYLE.dim(f"  (page {page + 1}/{total_pages})")
-        )
-        print(STYLE.dim("Toggle folder names to skip anywhere under the targets."))
-        print()
-
-        for offset, name in enumerate(chunk):
-            index = start + offset + 1
+        header = [STYLE.dim("Protected paths (OS, session, Xenon) stay skipped.")]
+        for title, detail in PROTECTED_CATEGORIES:
+            header.append(f"  {STYLE.green('✓')} {title}  {STYLE.dim(detail)}")
+        items: list[Choice] = []
+        for name in chunk:
             enabled = bool(policy.optional_dirs.get(name, True))
-            mark = STYLE.green("[x]") if enabled else STYLE.dim("[ ]")
-            desc = OPTIONAL_DIR_CATALOG[name]
-            print(f"  {mark} {STYLE.cyan(f'{index:>2}')}  {name:<28} {STYLE.dim(desc)}")
-
-        print()
-        print(STYLE.bold("Custom paths"))
-        if policy.custom_paths:
-            for index, raw in enumerate(policy.custom_paths, 1):
-                print(f"  {STYLE.cyan(f'{index}')}  {raw}")
-        else:
-            print(STYLE.dim("  (none)"))
-
-        print()
-        print(STYLE.dim(_rule("·")))
-        print(
-            f"  {STYLE.cyan('t N')} toggle #N   "
-            f"{STYLE.cyan('n')}/{STYLE.cyan('p')} next/prev page   "
-            f"{STYLE.cyan('a')} add path"
+            items.append(
+                Choice(
+                    f"toggle:{name}",
+                    name,
+                    ("ON · " if enabled else "off · ") + OPTIONAL_DIR_CATALOG[name],
+                    group=f"Skip these folders  ·  page {page + 1}/{total_pages}",
+                    current=enabled,
+                )
+            )
+        if total_pages > 1:
+            if page > 0:
+                items.append(Choice("prev", "Previous page", group="Browse", shortcut="p"))
+            if page < total_pages - 1:
+                items.append(Choice("next", "Next page", group="Browse", shortcut="n"))
+        items.append(Choice("add", "Add custom path", group="Custom", shortcut="a"))
+        for index, raw in enumerate(policy.custom_paths, 1):
+            items.append(Choice(f"drop:{index - 1}", f"Remove {raw}", group="Custom"))
+        items.append(Choice("refresh", "Refresh running-file scan", group="Session", shortcut="r"))
+        items.append(Choice("done", "Save and back", group="Session", shortcut="b"))
+        choice = pick(
+            "Exclusions",
+            items,
+            subtitle="Select a folder name to toggle. These names are skipped under every target.",
+            header=header,
         )
-        print(
-            f"  {STYLE.cyan('d N')} delete custom #N   "
-            f"{STYLE.cyan('r')} refresh running scan   "
-            f"{STYLE.cyan('s')} save   "
-            f"{STYLE.cyan('b')} back"
-        )
-        print()
-        choice = input(STYLE.cyan("Exclusions › ")).strip().lower()
-
-        if choice in {"b", "back", ""}:
+        if choice in {None, "done"}:
             session.config["exclusions"] = policy.to_config()
             save_config(session.config, session.config_file)
             session.message = "Exclusions saved."
             session.message_ok = True
             return
-
-        if choice in {"s", "save"}:
-            session.config["exclusions"] = policy.to_config()
-            save_config(session.config, session.config_file)
-            print(STYLE.green("Saved."))
-            _pause()
-            continue
-
-        if choice in {"n", "next"}:
+        if choice == "next":
             page = min(total_pages - 1, page + 1)
             continue
-
-        if choice in {"p", "prev"}:
+        if choice == "prev":
             page = max(0, page - 1)
             continue
-
-        if choice in {"r", "refresh"}:
+        if choice == "refresh":
             count = len(policy.refresh_running_cache())
-            print(STYLE.green(f"Running-file protection refreshed ({count:,} paths)."))
-            _pause()
+            session.message = f"Running-file protection refreshed ({count:,} paths)."
+            session.message_ok = True
             continue
-
-        if choice == "a":
-            raw = input(STYLE.cyan("Path to exclude (absolute or target-relative) › ")).strip()
+        if choice == "add":
+            raw = ask_text("Path to exclude (absolute or target-relative)")
             if raw:
                 if raw not in policy.custom_paths:
                     policy.custom_paths.append(raw)
-                    print(STYLE.green(f"Added: {raw}"))
                 else:
                     print(STYLE.yellow("Already listed."))
-            _pause()
+                    _pause()
             continue
-
-        if choice.startswith("t "):
-            try:
-                index = int(choice.split(None, 1)[1])
-                name = names[index - 1]
-            except (ValueError, IndexError):
-                print(STYLE.red("Invalid toggle number."))
-                _pause()
-                continue
+        if choice.startswith("toggle:"):
+            name = choice.split(":", 1)[1]
             policy.optional_dirs[name] = not bool(policy.optional_dirs.get(name, True))
-            state = "ON" if policy.optional_dirs[name] else "OFF"
-            print(STYLE.green(f"{name} → {state}"))
-            _pause()
             continue
-
-        if choice.startswith("d "):
+        if choice.startswith("drop:"):
+            index = int(choice.split(":", 1)[1])
             try:
-                index = int(choice.split(None, 1)[1])
-                removed = policy.custom_paths.pop(index - 1)
-            except (ValueError, IndexError):
-                print(STYLE.red("Invalid custom path number."))
-                _pause()
+                policy.custom_paths.pop(index)
+            except IndexError:
                 continue
-            print(STYLE.green(f"Removed: {removed}"))
-            _pause()
             continue
-
-        print(STYLE.red("Unknown command."))
-        _pause()
 
 
 def run_setup(*, config_file: Path | None = None) -> int:
@@ -1667,19 +1933,31 @@ def run_setup(*, config_file: Path | None = None) -> int:
     session = SetupSession(config=config, config_file=target)
 
     actions = {
+        "targets": action_manage_targets,
+        "password": action_set_password,
+        "verify": action_verify,
+        "crypto": action_encryption_type,
+        "key": action_encryption_key,
+        "exclusions": action_manage_exclusions,
+        "panic": action_panic_hotkey,
         "1": action_manage_targets,
         "2": action_set_password,
         "3": action_verify,
         "4": action_encryption_type,
         "5": action_encryption_key,
         "6": action_manage_exclusions,
+        "7": action_panic_hotkey,
     }
 
     try:
         while True:
-            _render_menu(session)
-            choice = input(STYLE.cyan("Select [1-7] › ")).strip()
-            if choice == "7":
+            choice = pick(
+                "Setup",
+                _home_choices(session),
+                subtitle="Move with arrows or type a number. Enter selects.",
+                header=_status_lines(session) + [STYLE.dim(str(session.config_file))],
+            )
+            if choice in {None, "exit", "8", "q"}:
                 _clear()
                 print(render_banner())
                 print()
@@ -1687,7 +1965,7 @@ def run_setup(*, config_file: Path | None = None) -> int:
                 return 0
             action = actions.get(choice)
             if not action:
-                session.message = "Invalid option. Choose 1-7."
+                session.message = "Invalid option."
                 session.message_ok = False
                 continue
             action(session)

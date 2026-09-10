@@ -4,6 +4,7 @@ import errno
 import hmac
 import json
 import os
+import secrets
 import struct
 import tempfile
 from collections.abc import Callable
@@ -33,7 +34,8 @@ SUPPORTED_VERSIONS = {2, 3, 4}
 MODE_IN_PLACE = "in-place"
 MODE_READ_PROTECT = "read-protect"
 MODE_DESTROYED = "destroyed"
-DESTROY_OVERWRITE_PASSES = 3
+DESTROY_OVERWRITE_PASSES_MIN = 10
+DESTROY_OVERWRITE_PASSES_MAX = 20
 WIPE_CHUNK = 1024 * 1024
 SALT_SIZE = 16
 NONCE_SIZE = 12
@@ -793,26 +795,83 @@ def _kdf_block(
     }
 
 
-def _overwrite_file(path: Path, *, passes: int = DESTROY_OVERWRITE_PASSES) -> None:
+def _overwrite_file(path: Path, *, passes: int | None = None) -> None:
     try:
         size = path.stat().st_size
     except OSError:
         return
     if size <= 0:
         return
-    patterns = (b"\x00", b"\xff", None)
+    if passes is None:
+        span = DESTROY_OVERWRITE_PASSES_MAX - DESTROY_OVERWRITE_PASSES_MIN + 1
+        passes = DESTROY_OVERWRITE_PASSES_MIN + secrets.randbelow(span)
     with path.open("r+b", buffering=0) as handle:
-        for index in range(passes):
-            pattern = patterns[index] if index < len(patterns) else None
+        for _ in range(passes):
             handle.seek(0)
             remaining = size
             while remaining:
                 chunk = min(remaining, WIPE_CHUNK)
-                data = os.urandom(chunk) if pattern is None else (pattern * chunk)
-                handle.write(data)
+                handle.write(os.urandom(chunk))
                 remaining -= chunk
             handle.flush()
             os.fsync(handle.fileno())
+
+
+def _remove_empty_directories(root: Path) -> int:
+    """Remove leftover folders under root, including .xenon and the root if empty."""
+    root = root.resolve()
+    removed = 0
+    for dirpath, _dirnames, _filenames in os.walk(
+        root,
+        topdown=False,
+        onerror=lambda _exc: None,
+        followlinks=False,
+    ):
+        current = Path(dirpath)
+        if current == root:
+            continue
+        try:
+            if current.is_symlink():
+                continue
+            current.rmdir()
+        except OSError:
+            continue
+        removed += 1
+    if not _protected_destroy_root(root):
+        try:
+            if not root.is_symlink():
+                root.rmdir()
+                removed += 1
+        except OSError:
+            pass
+    return removed
+
+
+def _protected_destroy_root(root: Path) -> bool:
+    resolved = root.resolve()
+    if resolved == Path(resolved.anchor):
+        return True
+    try:
+        if resolved == Path.home().resolve():
+            return True
+    except OSError:
+        pass
+    return False
+
+
+def _erase_xenon_dir(root: Path, *, overwrite: bool) -> None:
+    meta = xenon_dir(root)
+    if not meta.is_dir():
+        return
+    for path in sorted(meta.rglob("*"), key=lambda item: len(item.parts), reverse=True):
+        try:
+            if path.is_symlink() or not path.is_file():
+                continue
+        except OSError:
+            continue
+        if overwrite:
+            _overwrite_file(path)
+        path.unlink(missing_ok=True)
 
 
 def _lock_read_protect(
@@ -942,8 +1001,6 @@ def _destroy_directory(
     if not files:
         raise ValueError("Directory contains no files to delete.")
 
-    level = 5 if overwrite else 4
-    method = "overwrite" if overwrite else "unlink"
     action = "Destroying" if overwrite else "Deleting"
     print(f"{action} files in: {root}")
     print()
@@ -951,6 +1008,7 @@ def _destroy_directory(
 
     progress = Progress(action, total=len(files))
     removed = 0
+    dirs_removed = 0
     try:
         for path in files:
             relative = path.relative_to(root).as_posix()
@@ -959,18 +1017,8 @@ def _destroy_directory(
                 _overwrite_file(path)
             path.unlink()
             removed += 1
-        xenon_dir(root).mkdir(parents=True, exist_ok=True)
-        tombstone = {
-            "version": VERSION,
-            "mode": MODE_DESTROYED,
-            "aggressiveness": level,
-            "method": method,
-            "files_removed": removed,
-        }
-        manifest_path(root).write_text(
-            json.dumps(tombstone, indent=2) + "\n",
-            encoding="utf-8",
-        )
+        _erase_xenon_dir(root, overwrite=overwrite)
+        dirs_removed = _remove_empty_directories(root)
     finally:
         progress.close()
 
@@ -979,8 +1027,7 @@ def _destroy_directory(
         print("Files overwritten and deleted. This cannot be undone.")
     else:
         print("Files deleted without overwrite. Forensic recovery may still be possible.")
-    print(f"Removed: {removed}")
-    print(f"Marker: {manifest_path(root)}")
+    print(f"Removed: {removed} files, {dirs_removed} directories")
 
 
 def lock_directory(

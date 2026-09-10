@@ -8,6 +8,15 @@ from pathlib import Path
 from xenon.exclusions import DEFAULT_OPTIONAL_ENABLED, OPTIONAL_DIR_CATALOG, ExclusionPolicy
 from xenon.vault import CIPHER_CHACHA, check_password_verifier, make_password_verifier
 from xenon.aggressiveness import DEFAULT_AGGRESSIVENESS, normalize_aggressiveness
+from xenon.fx import (
+    DEFAULT_ANIMATION,
+    DEFAULT_DISPLAY,
+    DEFAULT_DURATION,
+    DEFAULT_ORDER,
+    DEFAULT_PRESET,
+    DEFAULT_TTY,
+    playback_from_config,
+)
 
 DEFAULT_CONFIG_DIR = Path.home() / ".config" / "xenon"
 DEFAULT_CONFIG_PATH = DEFAULT_CONFIG_DIR / "config.json"
@@ -38,6 +47,19 @@ DEFAULT_CONFIG = {
     "trigger": {
         "desktop": None,
         "chord": "SUPER CTRL ALT SHIFT, X",
+    },
+    "panic": {
+        "preset": DEFAULT_PRESET,
+        "animation": DEFAULT_ANIMATION,
+        "effects": [],
+        "duration": DEFAULT_DURATION,
+        "display": DEFAULT_DISPLAY,
+        "tty": DEFAULT_TTY,
+        "music": "",
+        "wait_for_music": False,
+        "poweroff_after_track": False,
+        "script_flash": False,
+        "effect_order": DEFAULT_ORDER,
     },
 }
 
@@ -132,6 +154,9 @@ def merge_config(data: dict) -> dict:
     trigger = deepcopy(DEFAULT_CONFIG["trigger"])
     trigger.update(data.get("trigger") or {})
     config["trigger"] = trigger
+
+    panic = playback_from_config({"panic": {**(DEFAULT_CONFIG["panic"]), **(data.get("panic") or {})}}).as_config()
+    config["panic"] = panic
     return config
 
 

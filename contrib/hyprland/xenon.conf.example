@@ -1,4 +1,4 @@
 # Project Xenon panic trigger (Hyprland)
 # Optional — not required by the core CLI.
-# Requires `xenon` on PATH (run: ./scripts/install.sh)
-bind = SUPER CTRL ALT SHIFT, X, exec, xenon panic --gui
+# Use the wrapper so the compositor does not need xenon on PATH.
+bind = SUPER CTRL ALT SHIFT, X, exec, ~/.local/lib/xenon/panic-trigger

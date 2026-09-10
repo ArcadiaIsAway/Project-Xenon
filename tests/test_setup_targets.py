@@ -103,6 +103,52 @@ def test_panic_skips_already_locked(tmp_path: Path):
     assert payload["cipher"]["algorithm"]
 
 
+def test_panic_trigger_locks_without_password(tmp_path: Path):
+    sample = tmp_path / "docs"
+    sample.mkdir()
+    (sample / "a.txt").write_text("hello", encoding="utf-8")
+    config_path = tmp_path / "config.json"
+    save_config(
+        {
+            "targets": [str(sample)],
+            "lockdown": {
+                "enabled": False,
+                "backend": "none",
+                "lock_screen": False,
+                "kill_session": False,
+            },
+        },
+        config_path,
+    )
+    result = run_panic(triggered=True, config_file=config_path)
+    assert result == [sample]
+    assert is_locked(sample)
+    assert is_passwordless_vault(sample)
+
+
+def test_panic_trigger_skips_already_locked(tmp_path: Path):
+    sample = tmp_path / "docs"
+    sample.mkdir()
+    (sample / "a.txt").write_text("hello", encoding="utf-8")
+    lock_directory(sample, "unit-test-password")
+    config_path = tmp_path / "config.json"
+    config = {
+        "targets": [str(sample)],
+        "lockdown": {
+            "enabled": False,
+            "backend": "none",
+            "lock_screen": False,
+            "kill_session": False,
+        },
+    }
+    set_config_password(config, "unit-test-password")
+    save_config(config, config_path)
+    result = run_panic(triggered=True, config_file=config_path)
+    assert result == [sample]
+    assert is_locked(sample)
+    assert not is_passwordless_vault(sample)
+
+
 def test_panic_refuses_without_configured_password(tmp_path: Path):
     sample = tmp_path / "docs"
     sample.mkdir()
@@ -219,7 +265,7 @@ def test_setup_opens_when_targets_are_locked(tmp_path: Path, monkeypatch):
             AssertionError("setup must not prompt for a password on entry")
         ),
     )
-    monkeypatch.setattr("builtins.input", lambda *args, **kwargs: "7")
+    monkeypatch.setattr("builtins.input", lambda *args, **kwargs: "8")
     assert run_setup(config_file=config_path) == 0
     assert is_locked(sample)
 
@@ -255,7 +301,7 @@ def test_setup_lock_unlock_passwordless(tmp_path: Path, monkeypatch):
     assert (sample / "a.txt").read_text(encoding="utf-8") == "hello"
 
 
-def test_setup_panic_refuses_passwordless(tmp_path: Path, monkeypatch):
+def test_setup_panic_runs_without_password(tmp_path: Path, monkeypatch):
     sample = tmp_path / "docs"
     sample.mkdir()
     (sample / "a.txt").write_text("hello", encoding="utf-8")
@@ -277,7 +323,8 @@ def test_setup_panic_refuses_passwordless(tmp_path: Path, monkeypatch):
     monkeypatch.setattr("builtins.input", lambda *args, **kwargs: "YES")
 
     _run_panic_targets(session, [str(sample)])
-    assert not is_locked(sample)
+    assert is_locked(sample)
+    assert is_passwordless_vault(sample)
 
 
 def test_setup_change_password_requires_old(tmp_path: Path, monkeypatch):
@@ -408,5 +455,5 @@ def test_setup_delete_level_requires_yes(tmp_path: Path, monkeypatch):
 
     monkeypatch.setattr("builtins.input", lambda *args, **kwargs: "YES")
     _run_lock_targets(session, [str(sample)])
-    assert not (sample / "a.txt").exists()
-    assert is_destroyed_vault(sample)
+    assert not sample.exists()
+    assert not is_destroyed_vault(sample)

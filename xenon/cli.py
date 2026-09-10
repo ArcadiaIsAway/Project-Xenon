@@ -18,9 +18,10 @@ from xenon.config import (
 )
 from xenon.aggressiveness import get_level
 from xenon.desktop import install_trigger, render_trigger
+from xenon.fx import preview_panic_spectacle
 from xenon.panic import run_panic
 from xenon.probe import probe_scope
-from xenon.prompt import confirm, prompt_password
+from xenon.prompt import confirm
 from xenon.setup_ui import run_setup
 from xenon.vault import (
     CIPHER_CHACHA,
@@ -223,9 +224,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Encrypt configured targets, then run optional lockdown.",
     )
     panic_parser.add_argument(
+        "--preview",
+        action="store_true",
+        help="Play the configured panic spectacle only — no lock, wipe, or shutdown.",
+    )
+    panic_parser.add_argument(
+        "--trigger",
+        action="store_true",
+        help="Hotkey path: run immediately with no prompts or password.",
+    )
+    panic_parser.add_argument(
         "--gui",
         action="store_true",
-        help="Prefer a GUI password prompt when available.",
+        help="Prefer a GUI confirmation prompt when available.",
     )
     panic_parser.add_argument("--yes", action="store_true")
     panic_parser.add_argument(
@@ -241,12 +252,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     trigger_parser = subparsers.add_parser(
         "install-trigger",
-        help="Install an optional desktop hotkey hook.",
+        help="Install a desktop hotkey that runs panic with no password prompt.",
     )
     trigger_parser.add_argument(
         "--desktop",
-        default="hyprland",
-        help="Desktop environment hook to install (default: hyprland).",
+        default="auto",
+        help="Desktop/compositor to bind (default: auto-detect).",
     )
     trigger_parser.add_argument("--chord")
     trigger_parser.add_argument("--print-only", action="store_true")
@@ -356,7 +367,15 @@ def main(argv: list[str] | None = None) -> int:
             return exit_code
 
         elif args.command == "panic":
-            if not args.yes:
+            if args.preview:
+                print(
+                    "Preview: playing panic effects only — "
+                    "no lock, no wipe, no session kill, no shutdown."
+                )
+                preview_panic_spectacle(_optional_config(args.config))
+                return 0
+
+            if not args.trigger and not args.yes:
                 if not confirm(
                     gui=args.gui,
                     text="Trigger Xenon panic lockdown?",
@@ -364,22 +383,9 @@ def main(argv: list[str] | None = None) -> int:
                     print("Panic cancelled.")
                     return 0
 
-            config = load_config(args.config)
-            if not password_configured(config):
-                raise ValueError(
-                    "Panic requires a configured password. Set one with: xenon setup"
-                )
-
-            password = prompt_password(
-                gui=args.gui,
-                title="Xenon Panic",
-                prompt="Password:",
-            )
-            if not password:
-                raise ValueError("Panic cannot run without a password.")
-
             run_panic(
-                password,
+                "",
+                triggered=True,
                 target=args.target,
                 lock_screen=False if args.no_lock_screen else None,
                 kill_session=False if args.no_kill_session else None,
@@ -387,22 +393,30 @@ def main(argv: list[str] | None = None) -> int:
             )
 
         elif args.command == "install-trigger":
+            chord = args.chord
+            if chord is None:
+                try:
+                    chord = load_config()["trigger"]["chord"]
+                except FileNotFoundError:
+                    chord = None
             if args.print_only:
-                chord = args.chord
-                if chord is None:
-                    try:
-                        chord = load_config()["trigger"]["chord"]
-                    except FileNotFoundError:
-                        chord = None
                 print(render_trigger(args.desktop, chord=chord), end="")
             else:
-                path = install_trigger(
-                    args.desktop,
-                    chord=args.chord,
-                )
-                print(f"Installed {args.desktop} trigger: {path}")
-                print("Reload your compositor/session if needed.")
-                print("Edit ~/.config/xenon/config.json before relying on panic.")
+                from xenon.desktop import resolve_desktop
+                from xenon.desktop.command import wrapper_path
+
+                resolved = resolve_desktop(args.desktop)
+                path = install_trigger(args.desktop, chord=chord)
+                print(f"Detected desktop: {resolved}")
+                print(f"Installed trigger: {path}")
+                print(f"Panic wrapper: {wrapper_path()}")
+                if resolved == "unknown":
+                    print(
+                        "Could not detect a desktop. Bind the wrapper to your "
+                        "chord in the compositor/DE settings."
+                    )
+                else:
+                    print("Reload your compositor/session if the bind is not live yet.")
 
     except KeyboardInterrupt:
         print("\nOperation cancelled.")
